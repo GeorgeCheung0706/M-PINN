@@ -1,0 +1,287 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from mpl_toolkits.mplot3d import Axes3D
+import time
+import logging
+import os
+from datetime import datetime
+
+# Configure logging with both file and console output
+def setup_logging():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f'MI_PINN_training_{timestamp}.log'
+    logger = logging.getLogger()
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(message)s',
+        handlers=[
+            logging.FileHandler(log_filename, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    
+    return log_filename
+log_filename = setup_logging()
+logger = logging.getLogger(__name__)
+
+torch.manual_seed(42)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {DEVICE}")
+
+
+def menet_pricer(t0, S0, K, T, r, sigma, num_paths, num_timesteps):
+    with torch.no_grad():
+        dt = (T - t0) / num_timesteps
+        S = S0.expand(-1, num_paths)
+        for _ in range(num_timesteps):
+            Z = torch.randn_like(S)
+            drift = (r - 0.5 * sigma**2) * dt
+            diffusion = sigma * torch.sqrt(dt) * Z
+            S = S * torch.exp(drift + diffusion)
+        payoff = torch.relu(S - K)
+        expected_payoff = torch.mean(payoff, dim=1, keepdim=True)
+        price = expected_payoff * torch.exp(-r * (T - t0))
+        return price
+
+# Network Structure (MLP)
+class PINN_BS(nn.Module):
+    def __init__(self, layers=4, hidden_dim=64):
+        super(PINN_BS, self).__init__()
+        layer_list = [nn.Linear(2, hidden_dim), nn.Tanh()]
+        for _ in range(layers - 2):
+            layer_list.extend([nn.Linear(hidden_dim, hidden_dim), nn.Tanh()])
+        layer_list.append(nn.Linear(hidden_dim, 1))
+        self.net = nn.Sequential(*layer_list)
+
+    def forward(self, x):
+        return self.net(x)
+
+#------------------------------------------------------------------------------
+# PDE loss
+#------------------------------------------------------------------------------
+def compute_pde_residual(model, t, S, K, r, sigma):
+    V = model(torch.cat([t, S], dim=1))
+    V_t = torch.autograd.grad(V, t, grad_outputs=torch.ones_like(V), create_graph=True)[0]
+    V_s = torch.autograd.grad(V, S, grad_outputs=torch.ones_like(V), create_graph=True)[0]
+    V_ss = torch.autograd.grad(V_s, S, grad_outputs=torch.ones_like(V_s), create_graph=True)[0]
+    residual = V_t + r * S * V_s + 0.5 * sigma**2 * S**2 * V_ss - r * V
+    return residual
+
+def train_model(model_type, params):
+    """Train either standard PINN or MI-PINN model with mini-batch processing"""
+    model = PINN_BS(layers=params['layers'], hidden_dim=params['hidden_dim']).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
+    
+    scheduler = None
+    if params['use_scheduler']:
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.7)
+
+    loss_history = []
+    start_time = time.time()
+
+    logger.info(f"\n-- start training {model_type} --")
+    logger.info("Epoch: Loss, Time(s)")
+    
+    for epoch in range(params['epochs']):
+        # Dynamic sampling each epoch
+        t_pde = torch.rand(params['N_interior'], 1, device=DEVICE) * params['T']
+        S_pde = torch.rand(params['N_interior'], 1, device=DEVICE) * \
+                (params['S_max'] - params['S_min']) + params['S_min']
+        t_bc = torch.ones(params['N_bc'], 1, device=DEVICE) * params['T']
+        S_bc = torch.rand(params['N_bc'], 1, device=DEVICE) * \
+               (params['S_max'] - params['S_min']) + params['S_min']
+        
+        # Mini-batch iteration
+        num_batches = max(1, params['N_interior'] // params['batch_size'])
+        perm_interior = torch.randperm(params['N_interior'], device=DEVICE)
+        perm_bc = torch.randperm(params['N_bc'], device=DEVICE)
+        
+        epoch_loss = 0.0
+        for b in range(num_batches):
+            start_idx = b * params['batch_size']
+            end_idx = min(start_idx + params['batch_size'], params['N_interior'])
+            batch_size_actual = end_idx - start_idx
+            idx_interior = perm_interior[start_idx:end_idx]
+            
+            start_bc = (b * params['batch_size']) % params['N_bc']
+            idx_bc = perm_bc[start_bc : start_bc + batch_size_actual]
+            if len(idx_bc) < batch_size_actual:
+                extra = batch_size_actual - len(idx_bc)
+                idx_bc = torch.cat([idx_bc, perm_bc[:extra]])
+            
+            t_pde_batch = t_pde[idx_interior]
+            S_pde_batch = S_pde[idx_interior]
+            t_bc_batch = t_bc[idx_bc]
+            S_bc_batch = S_bc[idx_bc]
+            
+            optimizer.zero_grad()
+            
+            # PDE loss
+            t_pde_batch.requires_grad = True
+            S_pde_batch.requires_grad = True
+            pde_residual = compute_pde_residual(model, t_pde_batch, S_pde_batch, 
+                                                params['K'], params['r'], params['sigma'])
+            loss_pde = torch.mean(pde_residual**2)
+
+            # Boundary condition loss
+            V_pred_bc = model(torch.cat([t_bc_batch, S_bc_batch], dim=1))
+            V_true_bc = torch.relu(S_bc_batch - params['K'])
+            loss_bc = torch.mean((V_pred_bc - V_true_bc)**2)
+
+            total_loss = loss_pde + params['lambda_bc'] * loss_bc
+
+            # Add martingale constraint for MI-PINN
+            if model_type == 'MI-PINN':
+                batch_martingale = min(batch_size_actual, params['N_martingale'] // num_batches)
+                t_martingale = torch.rand(batch_martingale, 1, device=DEVICE) * (params['T'] * 0.99)
+                S_martingale = torch.rand(batch_martingale, 1, device=DEVICE) * \
+                               (params['S_max'] - params['S_min']) + params['S_min']
+            
+                V_pinn_martingale = model(torch.cat([t_martingale, S_martingale], dim=1))
+                V_menet_martingale = menet_pricer(t_martingale, S_martingale,
+                                                 params['K'], params['T'], params['r'], params['sigma'],
+                                                 params['menet_paths'], params['menet_steps'])
+                loss_martingale = torch.mean((V_pinn_martingale - V_menet_martingale)**2)
+                total_loss += params['lambda_martingale'] * loss_martingale
+
+            total_loss.backward()
+            optimizer.step()
+            epoch_loss += total_loss.item()
+        
+        epoch_loss /= num_batches
+        loss_history.append(epoch_loss)
+        
+        if scheduler is not None:
+            scheduler.step()
+
+        if (epoch + 1) % 2000 == 0:
+            elapsed = time.time() - start_time
+            log_msg = f"Epoch [{epoch+1}/{params['epochs']}], Loss: {epoch_loss:.6f}, Time={elapsed:.2f}s"
+            if model_type == 'MI-PINN' and 'loss_martingale' in locals():
+                log_msg += f", Martingale Loss: {loss_martingale.item():.6f}"
+            logger.info(log_msg)
+    
+    end_time = time.time()
+    training_time = end_time - start_time
+    logger.info(f"-- training finished, training time: {training_time:.2f} --")
+    return model, loss_history, training_time
+
+
+if __name__ == '__main__':
+    n = 1  # For consistency (1D problem)
+    shared_params = {
+        'K': 1.0, 'T': 1.0, 'r': 0.05, 'sigma': 0.2,
+        'S_min': 0.5, 'S_max': 1.5,
+        'hidden_dim': 64, 'layers': 4, # PINN network parameters
+        'lr': 1e-3, 'epochs': 10000, 'batch_size': 512,
+        'use_scheduler': True,
+        'lambda_bc': 100.0, 'lambda_martingale': 1.0,
+        # Proper scaling for 1D problem
+        'N_interior': 10000 * n,
+        'N_bc': 2000 * n,
+        'N_martingale': 2000 * n,
+        'menet_paths': 2000, 'menet_steps': 252
+    }
+    
+    logger.info("Starting MI-PINN Training and Evaluation")
+    logger.info(f"Parameters: {shared_params}")
+    
+    std_pinn_model, std_loss_hist, std_time = train_model('PINN', shared_params)
+    mi_pinn_model, mi_loss_hist, mi_time = train_model('MI-PINN', shared_params)
+    
+    logger.info("\n-- Evaluation --")
+    
+    def black_scholes_call_numpy(t, S, K, T, r, sigma):
+        epsilon = 1e-8
+        T_t = T - t + epsilon
+        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T_t) / (sigma * np.sqrt(T_t))
+        d2 = d1 - sigma * np.sqrt(T_t)
+        return (S * norm.cdf(d1) - K * np.exp(-r * T_t) * norm.cdf(d2))
+    
+    T = shared_params['T']
+    t_grid_np = np.linspace(0, T, 100)
+    S_grid_np = np.linspace(shared_params['S_min'], shared_params['S_max'], 100)
+    T_mesh, S_mesh = np.meshgrid(t_grid_np, S_grid_np)
+    grid_points = torch.tensor(np.stack([T_mesh.flatten(), S_mesh.flatten()], axis=-1), dtype=torch.float32).to(DEVICE)
+    
+    V_true = black_scholes_call_numpy(T_mesh, S_mesh, **{k: shared_params[k] for k in ['K', 'T', 'r', 'sigma']})
+    
+    std_pinn_model.eval()
+    mi_pinn_model.eval()
+    with torch.no_grad():
+        V_pred_std = std_pinn_model(grid_points).cpu().numpy().reshape(T_mesh.shape)
+        V_pred_mi = mi_pinn_model(grid_points).cpu().numpy().reshape(T_mesh.shape)
+    
+    # Calculate all three error metrics
+    error_std = np.linalg.norm(V_pred_std - V_true) / np.linalg.norm(V_true)
+    error_mi = np.linalg.norm(V_pred_mi - V_true) / np.linalg.norm(V_true)
+    mae_std = np.mean(np.abs(V_pred_std - V_true))
+    mae_mi = np.mean(np.abs(V_pred_mi - V_true))
+    mse_std = np.mean((V_pred_std - V_true)**2)
+    mse_mi = np.mean((V_pred_mi - V_true)**2)
+    
+    log_msg_header = "\n" + "="*50
+    log_msg_header += "\n" + " " * 15 + "Comparison"
+    log_msg_header += "\n" + "="*50
+    log_msg_header += f"\n{'Metric':<25} | {'PINN':<15} | {'MI-PINN':<15}"
+    log_msg_header += "\n" + "-"*50
+    logger.info(log_msg_header)
+    
+    log_msg_body = f"{'Training Time (s)':<25} | {std_time:<15.2f} | {mi_time:<15.2f}"
+    log_msg_body += f"\n{'L2 Relative Error':<25} | {error_std:<15.4%} | {error_mi:<15.4%}"
+    log_msg_body += f"\n{'MAE (Mean Absolute Error)':<25} | {mae_std:<15.4e} | {mae_mi:<15.4e}"
+    log_msg_body += f"\n{'MSE (Mean Squared Error)':<25} | {mse_std:<15.4e} | {mse_mi:<15.4e}"
+    
+    log_msg_body += "\n" + "="*50 + "\n"
+    logger.info(log_msg_body)
+    
+    fig = plt.figure(figsize=(18, 10))
+    
+    # 1. loss comparison
+    ax1 = plt.subplot(2, 2, 1)
+    ax1.plot(std_loss_hist, label='PINN Loss')
+    ax1.plot(mi_loss_hist, label='MI-PINN Loss')
+    ax1.set_yscale('log')
+    ax1.set_title('Loss Convergence Comparison')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Total Loss (log scale)')
+    ax1.legend(); ax1.grid(True, which="both", ls="--")
+    
+    # 2. final accuracy
+    ax2 = plt.subplot(2, 2, 2)
+    ax2.plot(S_grid_np, V_true[:, 0], 'k-', label='Analytical Solution', linewidth=2)
+    ax2.plot(S_grid_np, V_pred_std[:, 0], 'r--', label=f'PINN (Err: {error_std:.2%})')
+    ax2.plot(S_grid_np, V_pred_mi[:, 0], 'b-.', label=f'MI-PINN (Err: {error_mi:.2%})')
+    ax2.set_title('Price Curve at t=0')
+    ax2.set_xlabel('Stock Price S')
+    ax2.set_ylabel('Option Price V')
+    ax2.legend(); ax2.grid(True)
+    
+    # 3. error surface
+    max_error = max(np.max(np.abs(V_pred_std - V_true)), np.max(np.abs(V_pred_mi - V_true)))
+    ax3 = plt.subplot(2, 2, 3, projection='3d')
+    p1 = ax3.plot_surface(T_mesh, S_mesh, np.abs(V_pred_std - V_true), cmap='hot', vmin=0, vmax=max_error)
+    ax3.set_title('PINN Absolute Error')
+    fig.colorbar(p1, ax=ax3, fraction=0.046, pad=0.04)
+    
+    ax4 = plt.subplot(2, 2, 4, projection='3d')
+    p2 = ax4.plot_surface(T_mesh, S_mesh, np.abs(V_pred_mi - V_true), cmap='hot', vmin=0, vmax=max_error)
+    ax4.set_title('MI-PINN Absolute Error')
+    fig.colorbar(p2, ax=ax4, fraction=0.046, pad=0.04)
+    
+    plt.tight_layout()
+    
+    plt.savefig('MI_PINN_comparison_results.png', dpi=300)
+    logger.info("Figure saved as: MI_PINN_comparison_results.png")
+    logger.info("Training and evaluation completed successfully!")
+    if log_filename:
+        logger.info(f"Log file saved as: {log_filename}")
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+    else:
+        logger.warning("Log file could not be created.")

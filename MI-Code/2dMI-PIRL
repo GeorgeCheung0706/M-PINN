@@ -1,0 +1,594 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import time
+import os
+from scipy.stats import multivariate_normal
+import math
+import logging
+from datetime import datetime
+
+# Configure logging with both file and console output
+def setup_logging():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f'2D_MI_PIRL_training_{timestamp}.log'
+    
+    # Get the root logger and clear its handlers to avoid duplicate outputs
+    logger = logging.getLogger()
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(message)s',  # Simple format without timestamp and level
+        handlers=[
+            logging.FileHandler(log_filename, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    
+    return log_filename
+
+# Setup logging at the beginning
+log_filename = setup_logging()
+logger = logging.getLogger(__name__)
+
+# Set device to GPU if available, otherwise CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {device}")
+
+# Clear GPU memory
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+torch.manual_seed(42)
+
+def menet_2d_min_call_pricer(t0, S1, S2, K, T, r, sigma1, sigma2, rho, num_paths, num_timesteps):
+    """Monte Carlo pricer for 2D min-call option using correlated geometric Brownian motion"""
+    with torch.no_grad():
+        batch_size = S1.shape[0]
+        dt = (T - t0) / num_timesteps
+        
+        # Convert parameters to tensors if they aren't already
+        if not isinstance(rho, torch.Tensor):
+            rho = torch.tensor(rho, device=device, dtype=torch.float32)
+        if not isinstance(sigma1, torch.Tensor):
+            sigma1 = torch.tensor(sigma1, device=device, dtype=torch.float32)
+        if not isinstance(sigma2, torch.Tensor):
+            sigma2 = torch.tensor(sigma2, device=device, dtype=torch.float32)
+        if not isinstance(r, torch.Tensor):
+            r = torch.tensor(r, device=device, dtype=torch.float32)
+        if not isinstance(K, torch.Tensor):
+            K = torch.tensor(K, device=device, dtype=torch.float32)
+        
+        # Initialize stock prices
+        S1_paths = S1.expand(-1, num_paths)  # [batch_size, num_paths]
+        S2_paths = S2.expand(-1, num_paths)  # [batch_size, num_paths]
+        
+        # Pre-calculate drift terms
+        drift1 = (r - 0.5 * sigma1**2) * dt
+        drift2 = (r - 0.5 * sigma2**2) * dt
+        vol1 = sigma1 * torch.sqrt(dt)
+        vol2 = sigma2 * torch.sqrt(dt)
+        
+        # Pre-calculate correlation coefficient for Z2
+        sqrt_term = torch.sqrt(torch.clamp(1 - rho**2, min=1e-8))  # Clamp to avoid numerical issues
+        
+        # Simulate correlated paths
+        for _ in range(num_timesteps):
+            # Generate correlated random numbers
+            Z1 = torch.randn_like(S1_paths)
+            Z2 = rho * Z1 + sqrt_term * torch.randn_like(S2_paths)
+            
+            # Update stock prices
+            S1_paths = S1_paths * torch.exp(drift1 + vol1 * Z1)
+            S2_paths = S2_paths * torch.exp(drift2 + vol2 * Z2)
+        
+        # Calculate min-call payoff
+        min_prices = torch.min(S1_paths, S2_paths)
+        payoff = torch.relu(min_prices - K)
+        expected_payoff = torch.mean(payoff, dim=1, keepdim=True)
+        
+        # Discount back to present value
+        price = expected_payoff * torch.exp(-r * (T - t0))
+        
+        return price
+
+class PIRL(nn.Module):
+    def __init__(self, input_dim=3, hidden_dim=32, output_dim=1, layers=5):
+        super(PIRL, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.layers = nn.ModuleList()
+        self.layers.append(nn.Linear(input_dim, hidden_dim))
+        for _ in range(layers - 2):
+            self.layers.append(nn.Linear(hidden_dim + input_dim, hidden_dim))
+        self.layers.append(nn.Linear(hidden_dim, output_dim))
+        self.activation = nn.Tanh()
+        self.apply(self.init_weights)
+
+    def init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            fan_in = m.in_features
+            fan_out = m.out_features
+            std = math.sqrt(2 / (fan_in + fan_out))
+            torch.nn.init.normal_(m.weight, mean=0.0, std=std)
+            m.weight.data = torch.clamp(m.weight.data, min=-2*std, max=2*std)
+            if m.bias is not None:
+                m.bias.data.zero_()
+
+    def forward(self, x):
+        original_input = x
+        x = self.layers[0](x)
+        x = self.activation(x)
+        for i in range(1, len(self.layers) - 1):
+            x_concat = torch.cat([x, original_input], dim=1)
+            update = self.layers[i](x_concat)
+            update = self.activation(update)
+            x = x + update  # Residual connection
+        output = self.layers[-1](x)
+        return output
+
+def pde_loss(model, S, t, r=0.05, sigma=None, rho=None):
+    """2D Black-Scholes PDE loss"""
+    if sigma is None:
+        sigma = torch.tensor([0.2, 0.2], device=device)
+    if rho is None:
+        rho = torch.tensor([[1.0, 0.5], [0.5, 1.0]], device=device)
+
+    S.requires_grad_(True)
+    t.requires_grad_(True)
+    St = torch.cat([S, t], dim=1)
+
+    V = model(St)
+
+    V_t = torch.autograd.grad(V, t, grad_outputs=torch.ones_like(V),
+                             create_graph=True, retain_graph=True)[0]
+    V_S = torch.autograd.grad(V, S, grad_outputs=torch.ones_like(V),
+                             create_graph=True, retain_graph=True)[0]
+
+    V_SS = torch.zeros(S.shape[0], 2, 2, device=device, dtype=torch.float32)
+    for j in range(2):
+        V_S_j = V_S[:, j]
+        V_SS_j = torch.autograd.grad(V_S_j, S, grad_outputs=torch.ones_like(V_S_j),
+                                    create_graph=True, retain_graph=True)[0]
+        V_SS[:, j, :] = V_SS_j
+
+    drift_term = torch.sum(r * S * V_S, dim=1)
+    diffusion_term = torch.zeros_like(drift_term)
+
+    for j in range(2):
+        for k in range(2):
+            diffusion_term += 0.5 * rho[j, k] * sigma[j] * sigma[k] * \
+                            S[:, j] * S[:, k] * V_SS[:, j, k]
+
+    pde_residual = V_t.squeeze() + drift_term + diffusion_term - r * V.squeeze()
+    loss = torch.mean(pde_residual ** 2)
+
+    return loss
+
+def bc_loss(model, S_bc, t_bc, K=1.0):
+    """Boundary condition loss for 2D min-call option"""
+    St = torch.cat([S_bc, t_bc], dim=1)
+    V_pred = model(St).squeeze()
+
+    min_vals = torch.min(S_bc, dim=1)[0] 
+    payoff = torch.relu(min_vals - K)
+
+    mse = torch.mean((V_pred - payoff) ** 2)
+    mae = torch.mean(torch.abs(V_pred - payoff))
+
+    return mse, mae
+
+def stulz_min_call(V, H, F, tau, R, sigma_V, sigma_H, rho_VH):
+    """Stulz analytical formula for min-call option on two assets"""
+    sigma_sq = sigma_V**2 + sigma_H**2 - 2 * rho_VH * sigma_V * sigma_H
+    if sigma_sq < 0:
+        sigma_sq = 0
+    sigma = np.sqrt(sigma_sq)
+
+    if sigma_H == 0 or sigma_V == 0 or tau == 0 or sigma == 0:
+        payoff = np.maximum(np.minimum(V, H) - F, 0)
+        return payoff * np.exp(-R * tau)
+
+    gamma1 = (np.log(H / F) + (R - 0.5 * sigma_H**2) * tau) / (sigma_H * np.sqrt(tau))
+    gamma2 = (np.log(V / F) + (R - 0.5 * sigma_V**2) * tau) / (sigma_V * np.sqrt(tau))
+
+    a1 = gamma1 + sigma_H * np.sqrt(tau)
+    b1 = (np.log(V / H) - 0.5 * sigma_sq * tau) / (sigma * np.sqrt(tau))
+    rho1 = (rho_VH * sigma_V - sigma_H) / sigma
+
+    a2 = gamma2 + sigma_V * np.sqrt(tau)
+    b2 = (np.log(H / V) - 0.5 * sigma_sq * tau) / (sigma * np.sqrt(tau))
+    rho2 = (rho_VH * sigma_H - sigma_V) / sigma
+
+    def N2(x, y, rho):
+        rho = np.clip(rho, -1.0, 1.0)
+        mean = [0, 0]
+        cov = [[1, rho], [rho, 1]]
+        upper_limits = [x, y]
+        return multivariate_normal.cdf(upper_limits, mean=mean, cov=cov)
+
+    term1 = H * N2(a1, b1, rho1)
+    term2 = V * N2(a2, b2, rho2)
+    term3 = F * np.exp(-R * tau) * N2(gamma1, gamma2, rho_VH)
+
+    return term1 + term2 - term3
+
+def train_model(model_type, params):
+    """Train either standard PIRL or MI-PIRL model with mini-batch processing"""
+    model = PIRL(input_dim=params['input_dim'], hidden_dim=params['hidden_dim'], 
+                layers=params['layers']).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
+    
+    if params['use_scheduler']:
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.7)
+    
+    loss_history = []
+    start_time = time.time()
+    
+    logger.info(f"\n-- start training {model_type} --")
+    logger.info("Epoch: Loss, LR, Time(s)")
+    
+    for epoch in range(params['epochs']):
+        # Dynamic sampling each epoch - match total2d.rtf exactly
+        S_interior = torch.rand(params['N_interior'], 2, device=device) * \
+                    (params['S_max'] - params['S_min']) + params['S_min']
+        t_interior = torch.rand(params['N_interior'], 1, device=device) * params['T']
+        S_bc = torch.rand(params['N_bc'], 2, device=device) * \
+               (params['S_max'] - params['S_min']) + params['S_min']
+        t_bc = torch.full((params['N_bc'], 1), params['T'], device=device)
+        
+        # Mini-batch iteration - match total2d.rtf structure
+        num_batches = max(1, params['N_interior'] // params['batch_size'])
+        perm_interior = torch.randperm(params['N_interior'], device=device)
+        perm_bc = torch.randperm(params['N_bc'], device=device)
+        
+        epoch_loss = 0.0
+        for b in range(num_batches):
+            start_idx = b * params['batch_size']
+            end_idx = min(start_idx + params['batch_size'], params['N_interior'])
+            batch_size_actual = end_idx - start_idx
+            idx_interior = perm_interior[start_idx:end_idx]
+            
+            start_bc = (b * params['batch_size']) % params['N_bc']
+            idx_bc = perm_bc[start_bc : start_bc + batch_size_actual]
+            if len(idx_bc) < batch_size_actual:
+                extra = batch_size_actual - len(idx_bc)
+                idx_bc = torch.cat([idx_bc, perm_bc[:extra]])
+            
+            S_int_batch = S_interior[idx_interior]
+            t_int_batch = t_interior[idx_interior]
+            S_bc_batch = S_bc[idx_bc]
+            t_bc_batch = t_bc[idx_bc]
+            
+            optimizer.zero_grad()
+            
+            # PDE loss
+            S_int_batch.requires_grad_(True)
+            t_int_batch.requires_grad_(True)
+            loss_pde = pde_loss(model, S_int_batch, t_int_batch, params['r'], 
+                               params['sigma_tensor'], params['rho_tensor'])
+            
+            # Boundary condition loss
+            mse_bc, _ = bc_loss(model, S_bc_batch, t_bc_batch, params['K'])
+            
+            total_loss = loss_pde + params['lambda_bc'] * mse_bc
+            
+            # Add martingale constraint for MI-PIRL
+            if model_type == 'MI-PIRL':
+                # Generate martingale points for this batch
+                batch_martingale = min(batch_size_actual, params['N_martingale'] // num_batches)
+                t_martingale = torch.rand(batch_martingale, 1, device=device) * (params['T'] * 0.99)
+                S1_martingale = torch.rand(batch_martingale, 1, device=device) * \
+                               (params['S_max'] - params['S_min']) + params['S_min']
+                S2_martingale = torch.rand(batch_martingale, 1, device=device) * \
+                               (params['S_max'] - params['S_min']) + params['S_min']
+                
+                # PINN prediction
+                St_martingale = torch.cat([torch.cat([S1_martingale, S2_martingale], dim=1), t_martingale], dim=1)
+                V_pinn_martingale = model(St_martingale)
+                
+                # Monte Carlo reference
+                V_menet_martingale = menet_2d_min_call_pricer(
+                    t_martingale, S1_martingale, S2_martingale, params['K'], params['T'],
+                    params['r'], params['sigma'][0], params['sigma'][1], params['rho_val'],
+                    params['menet_paths'], params['menet_steps']
+                )
+                
+                loss_martingale = torch.mean((V_pinn_martingale - V_menet_martingale)**2)
+                total_loss += params['lambda_martingale'] * loss_martingale
+            
+            total_loss.backward()
+            optimizer.step()
+            epoch_loss += total_loss.item()
+        
+        epoch_loss /= num_batches  # Average loss over batches
+        loss_history.append(epoch_loss)
+        
+        if params['use_scheduler']:
+            scheduler.step()
+        
+        if epoch % 2000 == 0:
+            elapsed = time.time() - start_time
+            lr_now = optimizer.param_groups[0]['lr']
+            log_msg = f"Epoch {epoch:6d}: Loss={epoch_loss:.4e}, LR={lr_now:.2e}, Time={elapsed:.2f}s"
+            if model_type == 'MI-PIRL' and 'loss_martingale' in locals():
+                log_msg += f", Martingale Loss={loss_martingale.item():.4e}"
+            logger.info(log_msg)
+    
+    end_time = time.time()
+    training_time = end_time - start_time
+    logger.info(f"-- training finished, training time: {training_time:.2f} --")
+    
+    # Final metrics on last boundary points
+    mse_bc_final, mae_bc_final = bc_loss(model, S_bc, t_bc, params['K'])
+    logger.info(f"Final Metrics: MSE={mse_bc_final.item():.4e}, MAE={mae_bc_final.item():.4e}")
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return model, loss_history, training_time
+
+def predict_option_price(model, S1, S2, t):
+    """Predict option price using trained model"""
+    model.eval()
+    with torch.no_grad():
+        S1_tensor = torch.tensor(S1, dtype=torch.float32, device=device).reshape(-1, 1)
+        S2_tensor = torch.tensor(S2, dtype=torch.float32, device=device).reshape(-1, 1)
+        t_tensor = torch.tensor(t, dtype=torch.float32, device=device).reshape(-1, 1)
+        St = torch.cat([S1_tensor, S2_tensor, t_tensor], dim=1)
+        prices = model(St).cpu().numpy().flatten()
+        return prices
+
+def generate_comparison_plots(model, model_mi, params, model_type="PIRL", model_mi_type="MI-PIRL"):
+    """Generate comparison plots similar to total2d.rtf"""
+    logger.info(f"\n-- Step: Generating Plots for {model_type} vs {model_mi_type} --")
+    
+    # Generate test data
+    N_test = 1000
+    S1_test = np.random.uniform(0.5, 1.5, N_test)
+    S2_test = np.random.uniform(0.5, 1.5, N_test)
+    t_test = np.random.uniform(0.1, params['T'], N_test)
+    tau_test = params['T'] - t_test
+    
+    # Predictions
+    M_pirl = predict_option_price(model, S1_test, S2_test, t_test)
+    M_mi_pirl = predict_option_price(model_mi, S1_test, S2_test, t_test)
+    
+    # Analytical solutions
+    M_analytical = np.array([
+        stulz_min_call(S1_test[i], S2_test[i], params['K'], tau_test[i],
+                      params['r'], params['sigma'][0], params['sigma'][1], params['rho_val'])
+        for i in range(N_test)
+    ])
+    
+    results_df = pd.DataFrame({
+        'S1': S1_test,
+        'S2': S2_test,
+        't': t_test,
+        'tau': tau_test,
+        'PIRL_Price': M_pirl,
+        'MI_PIRL_Price': M_mi_pirl,
+        'Analytical_Price': M_analytical
+    })
+    
+    results_df['PIRL_Abs_Error'] = np.abs(results_df['PIRL_Price'] - results_df['Analytical_Price'])
+    results_df['MI_PIRL_Abs_Error'] = np.abs(results_df['MI_PIRL_Price'] - results_df['Analytical_Price'])
+    results_df['PIRL_Rel_Error_Percent'] = (results_df['PIRL_Abs_Error'] / (results_df['Analytical_Price'] + 1e-8)) * 100
+    results_df['MI_PIRL_Rel_Error_Percent'] = (results_df['MI_PIRL_Abs_Error'] / (results_df['Analytical_Price'] + 1e-8)) * 100
+    
+    # Save results
+    results_df.to_csv(f"{model_type}_vs_{model_mi_type}_2d_results.csv", index=False)
+    
+    # Generate plots for both models
+    generate_model_plots(model, results_df, 'PIRL_Price', 'PIRL_Abs_Error', 'PIRL_Rel_Error_Percent', 
+                        params, model_name="PIRL")
+    generate_model_plots(model_mi, results_df, 'MI_PIRL_Price', 'MI_PIRL_Abs_Error', 'MI_PIRL_Rel_Error_Percent', 
+                        params, model_name="MI-PIRL")
+    
+    return results_df
+
+def generate_model_plots(model, results_df, price_col, abs_error_col, rel_error_col, params, model_name):
+    """Generate plots for a specific model (similar to total2d.rtf structure)"""
+    
+    t_plot = np.linspace(0.01, params['T'], 100)
+    S1_fixed, S2_fixed = [0.95, 1.10], [1.05, 1.00]
+    
+    plt.figure(figsize=(15, 10))
+    
+    plt.subplot(2, 3, 1)
+    colors = ['blue', 'red']
+    linestyles = ['--', '-']
+    markers = ['o', 's']
+    
+    for i in range(2):
+        S1_val, S2_val = S1_fixed[i], S2_fixed[i]
+        tau_plot = params['T'] - t_plot
+        
+        M_model_curve = predict_option_price(model,
+                                            np.full_like(t_plot, S1_val),
+                                            np.full_like(t_plot, S2_val),
+                                            t_plot)
+        
+        M_ana_curve = np.array([
+            stulz_min_call(S1_val, S2_val, params['K'], tau_plot[j],
+                          params['r'], params['sigma'][0], params['sigma'][1], params['rho_val'])
+            for j in range(len(tau_plot))
+        ])
+        
+        plt.plot(t_plot, M_model_curve, color=colors[i], linestyle=linestyles[0],
+                linewidth=2, marker=markers[i], markevery=20,
+                label=f'{model_name} (S1={S1_val}, S2={S2_val})')
+        plt.plot(t_plot, M_ana_curve, color=colors[i], linestyle=linestyles[1],
+                linewidth=2, label=f'Stulz (S1={S1_val}, S2={S2_val})')
+    
+    plt.xlabel('Time t', fontsize=12)
+    plt.ylabel('Option Price', fontsize=12)
+    plt.title(f'{model_name} vs Stulz: Option Price vs Time', fontsize=13)
+    plt.legend(fontsize=9)
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(2, 3, 2)
+    plt.hist(results_df[abs_error_col], bins=50, alpha=0.7, edgecolor='black')
+    plt.xlabel('Absolute Error', fontsize=12)
+    plt.ylabel('Frequency', fontsize=12)
+    plt.title(f'{model_name} Distribution of Absolute Errors', fontsize=13)
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(2, 3, 3)
+    plt.scatter(results_df['Analytical_Price'], results_df[price_col], alpha=0.6, s=10)
+    min_price = min(results_df['Analytical_Price'].min(), results_df[price_col].min())
+    max_price = max(results_df['Analytical_Price'].max(), results_df[price_col].max())
+    plt.plot([min_price, max_price], [min_price, max_price], 'r--', linewidth=2)
+    plt.xlabel('Stulz Analytical Price', fontsize=12)
+    plt.ylabel(f'{model_name} Price', fontsize=12)
+    plt.title(f'{model_name} vs Stulz Prices', fontsize=13)
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(2, 3, 4)
+    plt.scatter(results_df['Analytical_Price'], results_df[rel_error_col], alpha=0.6, s=10)
+    plt.xlabel('Stulz Analytical Price', fontsize=12)
+    plt.ylabel('Relative Error (%)', fontsize=12)
+    plt.title(f'{model_name} Relative Error vs Option Price', fontsize=13)
+    plt.grid(True, alpha=0.3)
+    
+    # Surface plot for current time
+    plt.subplot(2, 3, 5, projection='3d')
+    S1_grid = np.linspace(0.8, 1.2, 30)
+    S2_grid = np.linspace(0.8, 1.2, 30)
+    S1_mesh, S2_mesh = np.meshgrid(S1_grid, S2_grid)
+    t_fixed = 0.5
+    
+    S1_flat = S1_mesh.flatten()
+    S2_flat = S2_mesh.flatten()
+    t_flat = np.full_like(S1_flat, t_fixed)
+    
+    Z_model = predict_option_price(model, S1_flat, S2_flat, t_flat).reshape(S1_mesh.shape)
+    
+    surf = plt.gca().plot_surface(S1_mesh, S2_mesh, Z_model, cmap='viridis', alpha=0.8)
+    plt.gca().set_xlabel('Stock Price S1')
+    plt.gca().set_ylabel('Stock Price S2')
+    plt.gca().set_zlabel('Option Price')
+    plt.gca().set_title(f'{model_name} Option Prices (t={t_fixed})')
+    
+    # Error analysis
+    plt.subplot(2, 3, 6)
+    mae_model = np.mean(results_df[abs_error_col])
+    mse_model = np.mean(np.square(results_df[abs_error_col]))
+    mape_model = np.mean(results_df[rel_error_col])
+    
+    metrics = ['MAE', 'MSE', 'MAPE']
+    values = [mae_model, mse_model, mape_model]
+    bars = plt.bar(metrics, values, color='skyblue')
+    plt.ylabel('Error Value', fontsize=12)
+    plt.title(f'{model_name} Error Metrics', fontsize=13)
+    plt.grid(True, alpha=0.3)
+    
+    for bar, val in zip(bars, values):
+        plt.text(bar.get_x() + bar.get_width()/2., bar.get_height() + max(values)*0.01,
+                f'{val:.4e}' if val < 0.001 else f'{val:.4f}', 
+                ha='center', va='bottom', fontsize=10)
+    
+    plt.tight_layout()
+    plt.savefig(f"{model_name}_2d_comparison.png", dpi=200)
+    plt.show()
+    logger.info(f"Comparison plot saved to '{model_name}_2d_comparison.png'")
+
+def main():
+    # Parameters - match total2d.rtf exactly
+    n = 2  # For consistency with total2d.rtf
+    shared_params = {
+        'K': 1.0, 'T': 1.0, 'r': 0.05, 
+        'sigma': [0.2, 0.25], 'rho_val': 0.5,
+        'S_min': 0.5, 'S_max': 1.5,
+        'input_dim': 3, 'hidden_dim': 32, 'layers': 5,
+        'lr': 1e-3, 'epochs': 20000, 'batch_size': 512,
+        'use_scheduler': True,
+        'lambda_bc': 2.0, 'lambda_martingale': 1.0,
+        # Match total2d.rtf data sizes exactly
+        'N_interior': 10000 * n,  # 20000
+        'N_bc': 2000 * n,         # 4000
+        'N_martingale': 2000,
+        'menet_paths': 2000, 'menet_steps': 252
+    }
+    
+    # Convert parameters to tensors
+    shared_params['sigma_tensor'] = torch.tensor(shared_params['sigma'], device=device, dtype=torch.float32)
+    rho_matrix = np.array([[1.0, shared_params['rho_val']], [shared_params['rho_val'], 1.0]])
+    shared_params['rho_tensor'] = torch.tensor(rho_matrix, device=device, dtype=torch.float32)
+    
+    logger.info("Starting 2D MI-PIRL Training and Evaluation")
+    logger.info(f"Parameters: {shared_params}")
+    
+    logger.info("="*80)
+    logger.info("2D MI-PIRL vs 2D PIRL COMPARISON")
+    logger.info("="*80)
+    logger.info(f"Parameters: r={shared_params['r']}, sigma={shared_params['sigma']}, rho={shared_params['rho_val']}, T={shared_params['T']}, K={shared_params['K']}")
+    logger.info(f"Network: input_dim={shared_params['input_dim']}, hidden_dim={shared_params['hidden_dim']}, layers={shared_params['layers']}")
+    logger.info(f"Training epochs: {shared_params['epochs']}")
+    logger.info("-" * 60)
+    
+    # Train both models
+    std_pirl_model, std_loss_hist, std_time = train_model('PIRL', shared_params)
+    mi_pirl_model, mi_loss_hist, mi_time = train_model('MI-PIRL', shared_params)
+    
+    logger.info("\n-- Evaluation --")
+    
+    # Generate comparison plots
+    results_df = generate_comparison_plots(std_pirl_model, mi_pirl_model, shared_params)
+    
+    # Calculate error metrics for comparison
+    mae_std = np.mean(results_df['PIRL_Abs_Error'])
+    mse_std = np.mean(np.square(results_df['PIRL_Abs_Error']))
+    l2_error_std = np.linalg.norm(results_df['PIRL_Price'] - results_df['Analytical_Price']) / np.linalg.norm(results_df['Analytical_Price'])
+    
+    mae_mi = np.mean(results_df['MI_PIRL_Abs_Error'])
+    mse_mi = np.mean(np.square(results_df['MI_PIRL_Abs_Error']))
+    l2_error_mi = np.linalg.norm(results_df['MI_PIRL_Price'] - results_df['Analytical_Price']) / np.linalg.norm(results_df['Analytical_Price'])
+    
+    # Log comparison results
+    log_msg_header = "\n" + "="*50
+    log_msg_header += "\n" + " "*15 + "Comparison"
+    log_msg_header += "\n" + "="*50
+    log_msg_header += f"\n{'Metric':<25} | {'PIRL':<15} | {'MI-PIRL':<15}"
+    log_msg_header += "\n" + "-"*50
+    logger.info(log_msg_header)
+    
+    log_msg_body = f"{'Training Time (s)':<25} | {std_time:<15.2f} | {mi_time:<15.2f}"
+    log_msg_body += f"\n{'L2 Relative Error':<25} | {l2_error_std:<15.4%} | {l2_error_mi:<15.4%}"
+    log_msg_body += f"\n{'MAE (Mean Absolute Error)':<25} | {mae_std:<15.4e} | {mae_mi:<15.4e}"
+    log_msg_body += f"\n{'MSE (Mean Squared Error)':<25} | {mse_std:<15.4e} | {mse_mi:<15.4e}"
+    log_msg_body += "\n" + "="*50 + "\n"
+    logger.info(log_msg_body)
+    
+    # Generate loss comparison plot
+    fig = plt.figure(figsize=(10, 6))
+    plt.plot(std_loss_hist, label='PIRL Loss', linewidth=2)
+    plt.plot(mi_loss_hist, label='MI-PIRL Loss', linewidth=2)
+    plt.yscale('log')
+    plt.title('Loss Convergence Comparison', fontsize=14)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Total Loss (log scale)', fontsize=12)
+    plt.legend(fontsize=12)
+    plt.grid(True, which="both", ls="--", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('2D_MI_PIRL_loss_comparison.png', dpi=200)
+    plt.show()
+    logger.info("Loss comparison plot saved to '2D_MI_PIRL_loss_comparison.png'")
+    
+    logger.info("Training and evaluation completed successfully!")
+    if log_filename:
+        logger.info(f"Log file saved as: {log_filename}")
+        # Force flush all handlers
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+    else:
+        logger.warning("Log file could not be created.")
+
+if __name__ == '__main__':
+    main()

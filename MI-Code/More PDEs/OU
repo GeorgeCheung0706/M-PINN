@@ -1,0 +1,381 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+from mpl_toolkits.mplot3d import Axes3D
+import time
+import logging
+import os
+from datetime import datetime
+
+def setup_logging():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f'MI_PINN_OU_Process_{timestamp}.log'
+    logger = logging.getLogger()
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(message)s',
+        handlers=[
+            logging.FileHandler(log_filename, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    return log_filename
+
+log_filename = setup_logging()
+logger = logging.getLogger(__name__)
+
+torch.manual_seed(42)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {DEVICE}")
+
+
+
+def ornstein_uhlenbeck_solver(t0, x0, T, theta, mu, sigma, terminal_func, num_paths, num_timesteps):
+    """
+    Solves the backward Kolmogorov equation for O-U process using Monte Carlo simulation.
+    O-U SDE: dX_t = theta(mu - X_t)dt + sigma dW_t
+    Backward Kolmogorov PDE: u/t + theta(mu-x)u/x + (1/2)sigma^2 ²u/x² = 0
+    
+    The solution u(t,x) is the expected value of the terminal condition g(X_T)
+    where X_t follows the O-U process.
+    """
+    with torch.no_grad():
+        dt = (T - t0) / num_timesteps
+        
+        # Initialize paths
+        X = x0.expand(-1, num_paths)
+        
+        # Use analytical solution for O-U process (more accurate than Euler scheme)
+        time_to_maturity = T - t0
+        
+        # Analytical solution: X_T = X_t * exp(-theta*(T-t)) + mu*(1-exp(-theta*(T-t))) + noise
+        decay_factor = torch.exp(-theta * time_to_maturity)
+        mean_reversion = mu * (1 - decay_factor)
+        
+        # Variance of the process at time T given X_t
+        if theta > 0:
+            variance = (sigma**2 / (2 * theta)) * (1 - torch.exp(-2 * theta * time_to_maturity))
+        else:
+            variance = sigma**2 * time_to_maturity
+            
+        Z = torch.randn_like(X)
+        X_T = X * decay_factor + mean_reversion + torch.sqrt(variance) * Z
+        
+        payoff = terminal_func(X_T)
+        price = torch.mean(payoff, dim=1, keepdim=True)
+    
+        return price
+
+class PINN_OU(nn.Module):
+    def __init__(self, layers=4, hidden_dim=64):
+        super(PINN_OU, self).__init__()
+        layer_list = [nn.Linear(2, hidden_dim), nn.Tanh()]
+        for _ in range(layers - 2):
+            layer_list.extend([nn.Linear(hidden_dim, hidden_dim), nn.Tanh()])
+        layer_list.append(nn.Linear(hidden_dim, 1))
+        self.net = nn.Sequential(*layer_list)
+    
+    def forward(self, x):
+        return self.net(x)
+
+def compute_ou_pde_residual(model, t, x, theta, mu, sigma):
+    """
+    Compute residual for backward Kolmogorov equation:
+    u/t + theta(mu-x)u/x + (1/2)sigma^2 ²u/x² = 0
+    """
+    u = model(torch.cat([t, x], dim=1))
+    
+    u_t = torch.autograd.grad(u, t, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+    u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+    u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+    
+    # Backward Kolmogorov equation residual
+    residual = u_t + theta * (mu - x) * u_x + 0.5 * sigma**2 * u_xx
+    return residual
+
+def train_model(model_type, params):
+    model = PINN_OU(layers=params['layers'], hidden_dim=params['hidden_dim']).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
+    
+    scheduler = None
+    if params['use_scheduler']:
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.7)
+    
+    loss_history = []
+    start_time = time.time()
+    
+    logger.info(f"\n-- Start training {model_type} --")
+    logger.info("Epoch: Loss, Time(s)")
+    
+    # Define terminal condition (example: European call option payoff)
+    terminal_func = lambda x: torch.maximum(x - params['strike'], torch.zeros_like(x))
+    
+    for epoch in range(params['epochs']):
+        # Interior points for PDE
+        t_pde = torch.rand(params['N_interior'], 1, device=DEVICE) * params['T']
+        x_pde = torch.rand(params['N_interior'], 1, device=DEVICE) * \
+                (params['x_max'] - params['x_min']) + params['x_min']
+        
+        # Terminal condition points
+        t_terminal = torch.ones(params['N_boundary'], 1, device=DEVICE) * params['T']
+        x_terminal = torch.rand(params['N_boundary'], 1, device=DEVICE) * \
+                    (params['x_max'] - params['x_min']) + params['x_min']
+        
+        # Boundary points (if needed)
+        t_boundary = torch.rand(params['N_boundary'], 1, device=DEVICE) * params['T']
+        x_boundary_min = torch.full((params['N_boundary'] // 2, 1), params['x_min'], device=DEVICE)
+        
+        num_batches = max(1, params['N_interior'] // params['batch_size'])
+        perm_interior = torch.randperm(params['N_interior'], device=DEVICE)
+        perm_boundary = torch.randperm(params['N_boundary'], device=DEVICE)
+        
+        epoch_loss = 0.0
+        for b in range(num_batches):
+            start_idx = b * params['batch_size']
+            end_idx = min(start_idx + params['batch_size'], params['N_interior'])
+            idx_interior = perm_interior[start_idx:end_idx]
+            
+            batch_size_actual = end_idx - start_idx
+            start_bc = (b * params['batch_size']) % params['N_boundary']
+            idx_bc = perm_boundary[start_bc : start_bc + batch_size_actual]
+            if len(idx_bc) < batch_size_actual:
+                extra = batch_size_actual - len(idx_bc)
+                idx_bc = torch.cat([idx_bc, perm_boundary[:extra]])
+            
+            t_pde_batch, x_pde_batch = t_pde[idx_interior], x_pde[idx_interior]
+            t_terminal_batch, x_terminal_batch = t_terminal[idx_bc], x_terminal[idx_bc]
+            t_boundary_batch = t_boundary[idx_bc]
+            
+            x_boundary_min_batch = x_boundary_min[:len(t_boundary_batch)]
+            t_boundary_min_batch = t_boundary_batch[:len(x_boundary_min_batch)]
+
+            optimizer.zero_grad()
+            
+            # PDE residual loss
+            t_pde_batch.requires_grad = True
+            x_pde_batch.requires_grad = True
+            pde_residual = compute_ou_pde_residual(model, t_pde_batch, x_pde_batch, 
+                                                 params['theta'], params['mu'], params['sigma'])
+            loss_pde = torch.mean(pde_residual**2)
+            
+            # Terminal condition loss
+            u_pred_terminal = model(torch.cat([t_terminal_batch, x_terminal_batch], dim=1))
+            u_true_terminal = terminal_func(x_terminal_batch)
+            loss_terminal = torch.mean((u_pred_terminal - u_true_terminal)**2)
+            
+            # Boundary condition loss (enforce u=0 at the lower spatial boundary x_min)
+            u_pred_bc_min = model(torch.cat([t_boundary_min_batch, x_boundary_min_batch], dim=1))
+            loss_boundary = torch.mean(u_pred_bc_min**2)
+            
+            total_loss = loss_pde + params['lambda_boundary'] * (loss_terminal + loss_boundary)
+            
+            # MI-PINN specific: Feynman-Kac constraint
+            if model_type == 'MI-PINN':
+                batch_martingale = min(batch_size_actual, params['N_martingale'] // num_batches)
+                
+                t_fk = torch.rand(batch_martingale, 1, device=DEVICE) * params['T'] * 0.9
+                x_fk = torch.rand(batch_martingale, 1, device=DEVICE) * \
+                       (params['x_max'] - params['x_min']) + params['x_min']
+                
+                # Get PINN prediction
+                u_pinn_fk = model(torch.cat([t_fk, x_fk], dim=1))
+                
+                # Get Monte Carlo expectation using Feynman-Kac
+                u_mc_fk = ornstein_uhlenbeck_solver(
+                    t_fk, x_fk, params['T'], 
+                    params['theta'], params['mu'], params['sigma'], 
+                    terminal_func, params['mc_paths'], params['mc_steps']
+                )
+                loss_feynman_kac = torch.mean((u_pinn_fk - u_mc_fk.detach())**2)
+                
+                total_loss += params['lambda_martingale'] * loss_feynman_kac
+
+            total_loss.backward()
+            optimizer.step()
+        
+            epoch_loss += total_loss.item()
+        
+        epoch_loss /= num_batches
+        loss_history.append(epoch_loss)
+        
+        if scheduler is not None:
+            scheduler.step()
+        
+        if (epoch + 1) % 2000 == 0:
+            elapsed = time.time() - start_time
+            log_msg = f"Epoch [{epoch+1}/{params['epochs']}], Loss: {epoch_loss:.6f}, Time={elapsed:.2f}s"
+            if model_type == 'MI-PINN' and 'loss_feynman_kac' in locals():
+                log_msg += f", FK Loss: {loss_feynman_kac.item():.6f}"
+            logger.info(log_msg)
+    
+    end_time = time.time()
+    training_time = end_time - start_time
+    logger.info(f"-- Training finished, training time: {training_time:.2f}s --")
+    return model, loss_history, training_time
+
+def analytical_solution_ou_option(t, x, T, theta, mu, sigma, strike):
+    """
+    Analytical solution for European call option under O-U process.
+    Uses the exact transition density of the O-U process.
+    """
+    time_to_maturity = T - t
+    result = np.zeros_like(time_to_maturity)
+    valid_mask = time_to_maturity > 1e-10
+    
+    # For expired options (t >= T), return intrinsic value
+    result[~valid_mask] = np.maximum(x[~valid_mask] - strike, 0)
+    
+    if np.any(valid_mask):
+        ttm_valid = time_to_maturity[valid_mask]
+        x_valid = x[valid_mask]
+        
+        if abs(theta) > 1e-10:
+            decay_factor = np.exp(-theta * ttm_valid)
+            expected_xt = x_valid * decay_factor + mu * (1 - decay_factor)
+            variance_xt = (sigma**2 / (2 * theta)) * (1 - np.exp(-2 * theta * ttm_valid))
+        else:
+            expected_xt = x_valid + mu * ttm_valid
+            variance_xt = sigma**2 * ttm_valid
+        
+        std_xt = np.sqrt(np.maximum(variance_xt, 1e-10))
+        d = (expected_xt - strike) / std_xt
+        
+        call_price = (expected_xt - strike) * norm.cdf(d) + std_xt * norm.pdf(d)
+        result[valid_mask] = np.maximum(call_price, 0)
+    
+    return result
+
+if __name__ == '__main__':
+    n = 1
+    shared_params = {
+        'T': 1.0,
+        'theta': 2.0,
+        'mu': 0.0,
+        'sigma': 0.3,
+        'strike': 0.0,
+        'x_min': -2.0,
+        'x_max': 2.0,
+        'hidden_dim': 64, 
+        'layers': 4,
+        'lr': 1e-3, 
+        'epochs': 10000, 
+        'batch_size': 512,
+        'use_scheduler': True,
+        'lambda_boundary': 100.0,
+        'lambda_martingale': 0.5,  
+        'N_interior': 10000 * n,
+        'N_boundary': 2000 * n,
+        'N_martingale': 2000 * n,
+        'mc_paths': 100000,        
+        'mc_steps': 100
+    }
+    
+    logger.info("Starting MI-PINN (Ornstein-Uhlenbeck Process) Training and Evaluation")
+    logger.info(f"Parameters: {shared_params}")
+    
+    # Train models
+    std_pinn_model, std_loss_hist, std_time = train_model('PINN', shared_params)
+    mi_pinn_model, mi_loss_hist, mi_time = train_model('MI-PINN', shared_params)
+    
+    logger.info("\n-- Evaluation --")
+    
+    # Create evaluation grid
+    T = shared_params['T']
+    t_grid_np = np.linspace(0, T, 50)
+    x_grid_np = np.linspace(shared_params['x_min'], shared_params['x_max'], 50)
+    T_mesh, X_mesh = np.meshgrid(t_grid_np, x_grid_np)
+    grid_points = torch.tensor(np.stack([T_mesh.flatten(), X_mesh.flatten()], axis=-1), 
+                              dtype=torch.float32).to(DEVICE)
+    
+    # Analytical solution
+    U_true = analytical_solution_ou_option(T_mesh, X_mesh, shared_params['T'], 
+                                          shared_params['theta'], shared_params['mu'], 
+                                          shared_params['sigma'], shared_params['strike'])
+    
+    # Model predictions
+    std_pinn_model.eval()
+    mi_pinn_model.eval()
+    with torch.no_grad():
+        U_pred_std = std_pinn_model(grid_points).cpu().numpy().reshape(T_mesh.shape)
+        U_pred_mi = mi_pinn_model(grid_points).cpu().numpy().reshape(T_mesh.shape)
+    
+    # Compute errors
+    error_std = np.linalg.norm(U_pred_std - U_true) / np.linalg.norm(U_true)
+    error_mi = np.linalg.norm(U_pred_mi - U_true) / np.linalg.norm(U_true)
+    mae_std = np.mean(np.abs(U_pred_std - U_true))
+    mae_mi = np.mean(np.abs(U_pred_mi - U_true))
+    mse_std = np.mean((U_pred_std - U_true)**2)
+    mse_mi = np.mean((U_pred_mi - U_true)**2)
+    
+    # Log results
+    log_msg_header = "\n" + "="*50
+    log_msg_header += "\n" + " " * 15 + "Comparison"
+    log_msg_header += "\n" + "="*50
+    log_msg_header += f"\n{'Metric':<25} | {'PINN':<15} | {'MI-PINN':<15}"
+    log_msg_header += "\n" + "-"*50
+    logger.info(log_msg_header)
+    
+    log_msg_body = f"{'Training Time (s)':<25} | {std_time:<15.2f} | {mi_time:<15.2f}"
+    log_msg_body += f"\n{'L2 Relative Error':<25} | {error_std:<15.4%} | {error_mi:<15.4%}"
+    log_msg_body += f"\n{'MAE (Mean Absolute Error)':<25} | {mae_std:<15.4e} | {mae_mi:<15.4e}"
+    log_msg_body += f"\n{'MSE (Mean Squared Error)':<25} | {mse_std:<15.4e} | {mse_mi:<15.4e}"
+    log_msg_body += "\n" + "="*50 + "\n"
+    logger.info(log_msg_body)
+    
+    # Plotting
+    fig = plt.figure(figsize=(18, 10))
+    
+    # Loss convergence
+    ax1 = plt.subplot(2, 2, 1)
+    ax1.plot(std_loss_hist, label='PINN Loss')
+    ax1.plot(mi_loss_hist, label='MI-PINN Loss')
+    ax1.set_yscale('log')
+    ax1.set_title('Loss Convergence Comparison')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Total Loss (log scale)')
+    ax1.legend(); ax1.grid(True, which="both", ls="--")
+    
+    # Solution at t=0
+    ax2 = plt.subplot(2, 2, 2)
+    ax2.plot(x_grid_np, U_true[:, 0], 'k-', label='Analytical Solution', linewidth=2)
+    ax2.plot(x_grid_np, U_pred_std[:, 0], 'r--', label=f'PINN (Err: {error_std:.2%})')
+    ax2.plot(x_grid_np, U_pred_mi[:, 0], 'b-.', label=f'MI-PINN (Err: {error_mi:.2%})')
+    ax2.set_title('Solution at t=0')
+    ax2.set_xlabel('Position x')
+    ax2.set_ylabel('Option Value u(x)')
+    ax2.legend(); ax2.grid(True)
+    
+    # Error surfaces
+    max_error = max(np.max(np.abs(U_pred_std - U_true)), np.max(np.abs(U_pred_mi - U_true)))
+    
+    ax3 = plt.subplot(2, 2, 3, projection='3d')
+    p1 = ax3.plot_surface(T_mesh, X_mesh, np.abs(U_pred_std - U_true), 
+                         cmap='hot', vmin=0, vmax=max_error)
+    ax3.set_title('PINN Absolute Error')
+    ax3.set_xlabel('Time t')
+    ax3.set_ylabel('Position x')
+    fig.colorbar(p1, ax=ax3, fraction=0.046, pad=0.04)
+    
+    ax4 = plt.subplot(2, 2, 4, projection='3d')
+    p2 = ax4.plot_surface(T_mesh, X_mesh, np.abs(U_pred_mi - U_true), 
+                          cmap='hot', vmin=0, vmax=max_error)
+    ax4.set_title('MI-PINN Absolute Error')
+    ax4.set_xlabel('Time t')
+    ax4.set_ylabel('Position x')
+    fig.colorbar(p2, ax=ax4, fraction=0.046, pad=0.04)
+    
+    plt.tight_layout()
+    plt.savefig('MI_PINN_OU_Process_comparison.png', dpi=300)
+    logger.info("Figure saved as: MI_PINN_OU_Process_comparison.png")
+    logger.info("Training and evaluation completed successfully!")
+    
+    if log_filename:
+        logger.info(f"Log file saved as: {log_filename}")
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+    else:
+        logger.warning("Log file could not be created.")

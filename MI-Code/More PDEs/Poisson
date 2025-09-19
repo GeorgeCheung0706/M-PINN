@@ -1,0 +1,382 @@
+import math
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import time
+import logging
+import os
+from datetime import datetime
+
+# Configure logging with both file and console output
+def setup_logging():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f'MI_PINN_Poisson_MC_training_{timestamp}.log'
+    logger = logging.getLogger()
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(message)s',
+        handlers=[
+            logging.FileHandler(log_filename, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    return log_filename
+
+log_filename = setup_logging()
+logger = logging.getLogger(__name__)
+
+torch.manual_seed(42)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {DEVICE}")
+
+#------------------------------------------------------------------
+# Poisson Problem Definition
+# u(x,y) = sin(pi*x) * sin(pi*y)
+# f(x,y) = laplacian(u) = -2 * pi^2 * sin(pi*x) * sin(pi*y)
+#------------------------------------------------------------------
+
+def source_function(x, y):
+    """Source function f(x,y) for the Poisson problem."""
+    return -2 * (torch.pi**2) * torch.sin(torch.pi * x) * torch.sin(torch.pi * y)
+
+def poisson_monte_carlo_solver(start_points, mc_paths, mc_max_steps, mc_dt):
+    """
+    Solves the Poisson equation u_xx + u_yy = f using a Monte Carlo method
+    based on Brownian motion and the Feynman-Kac formula.
+    Assumes Dirichlet boundary conditions u=0 on the boundary of the [0,1]x[0,1] square.
+    
+    Args:
+        start_points (Tensor): A tensor of shape [N, 2] with starting (x,y) coordinates.
+        mc_paths (int): Number of random walk paths to simulate for each starting point.
+        mc_max_steps (int): Maximum number of steps for each walk to prevent infinite loops.
+        mc_dt (float): Time step for the Brownian motion simulation.
+    
+    Returns:
+        Tensor: A tensor of shape [N, 1] with the estimated u value for each starting point.
+    """
+    with torch.no_grad():
+        n_points = start_points.shape[0]
+        # Expand start_points for each path: [N, mc_paths, 2]
+        positions = start_points.unsqueeze(1).expand(n_points, mc_paths, 2).clone().to(DEVICE)
+        
+        # Accumulator for the integral part of the formula
+        integral_sum = torch.zeros(n_points, mc_paths, device=DEVICE)
+        
+        # Mask to track which paths are still active (inside the domain)
+        active_mask = torch.ones(n_points, mc_paths, dtype=torch.bool, device=DEVICE)
+        
+        sqrt_2dt = math.sqrt(2 * mc_dt)  # Correct scaling for generator Delta
+        
+        for _ in range(mc_max_steps):
+            if not active_mask.any():
+                break  # All paths have exited
+            
+            # Get indices of active paths for safer indexing
+            active_indices = torch.nonzero(active_mask, as_tuple=False)  # [num_active, 2]
+            num_active = active_indices.shape[0]
+            if num_active == 0:
+                break
+            
+            # Generate random steps for Brownian motion for active paths
+            random_steps = torch.randn(num_active, 2, device=DEVICE) * sqrt_2dt
+            
+            # Update positions of active paths
+            active_positions = positions[active_indices[:, 0], active_indices[:, 1]]
+            active_positions += random_steps
+            positions[active_indices[:, 0], active_indices[:, 1]] = active_positions
+            
+            # Update the integral sum using the source function at the new positions
+            f_values = source_function(active_positions[:, 0], active_positions[:, 1])
+            integral_sum[active_indices[:, 0], active_indices[:, 1]] += f_values * mc_dt
+            
+            # Update the active mask
+            # A path becomes inactive if it crosses any boundary
+            still_active_mask = ((active_positions[:, 0] > 0) & (active_positions[:, 0] < 1) & 
+                                 (active_positions[:, 1] > 0) & (active_positions[:, 1] < 1))
+            active_mask[active_indices[:, 0], active_indices[:, 1]] = still_active_mask
+        
+        # The final estimate is the mean of the integral over all paths (with sign correction)
+        u_estimate = -torch.mean(integral_sum, dim=1, keepdim=True)  # Fix sign for f < 0
+        return u_estimate
+
+# Network Structure (MLP)
+class PINN_Poisson(nn.Module):
+    def __init__(self, layers=4, hidden_dim=32):  # Reduced hidden_dim for speed
+        super(PINN_Poisson, self).__init__()
+        layer_list = [nn.Linear(2, hidden_dim), nn.Tanh()]
+        for _ in range(layers - 2):
+            layer_list.extend([nn.Linear(hidden_dim, hidden_dim), nn.Tanh()])
+        layer_list.append(nn.Linear(hidden_dim, 1))
+        self.net = nn.Sequential(*layer_list)
+    
+    def forward(self, x):
+        return self.net(x)
+
+# PDE loss for Poisson Equation
+def compute_pde_residual(model, x, y):
+    u = model(torch.cat([x, y], dim=1))
+    u_grads = torch.autograd.grad(u, [x, y], grad_outputs=torch.ones_like(u), create_graph=True)
+    u_x, u_y = u_grads[0], u_grads[1]
+    u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u_x), create_graph=True)[0]
+    u_yy = torch.autograd.grad(u_y, y, grad_outputs=torch.ones_like(u_y), create_graph=True)[0]
+    laplacian = u_xx + u_yy
+    f = source_function(x, y)
+    residual = laplacian - f
+    return residual
+
+def train_model(model_type, params):
+    """Train either standard PINN or MI-PINN model with consistent mini-batch processing"""
+    model = PINN_Poisson(layers=params['layers'], hidden_dim=params['hidden_dim']).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=params['lr'])
+    
+    scheduler = None
+    if params['use_scheduler']:
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.7)  # Adjusted for fewer epochs
+    
+    loss_history = []
+    start_time = time.time()
+    
+    logger.info(f"\n-- start training {model_type} --")
+    logger.info("Epoch: Loss, Time(s)")
+    
+    for epoch in range(params['epochs']):
+        logger.info(f"Starting epoch {epoch+1}/{params['epochs']} for {model_type}")
+        
+        # Dynamic sampling each epoch (similar to the Black-Scholes version)
+        x_pde = torch.rand(params['N_interior'], 1, device=DEVICE)
+        y_pde = torch.rand(params['N_interior'], 1, device=DEVICE)
+        
+        # Boundary Condition (BC) Points - generate more systematically
+        N_b = params['N_bc'] // 4
+        x_tb = torch.rand(N_b * 2, 1, device=DEVICE)
+        y_bottom, y_top = torch.zeros(N_b, 1, device=DEVICE), torch.ones(N_b, 1, device=DEVICE)
+        bc_bottom, bc_top = torch.cat([x_tb[:N_b], y_bottom], dim=1), torch.cat([x_tb[N_b:], y_top], dim=1)
+        
+        y_lr = torch.rand(N_b * 2, 1, device=DEVICE)
+        x_left, x_right = torch.zeros(N_b, 1, device=DEVICE), torch.ones(N_b, 1, device=DEVICE)
+        bc_left, bc_right = torch.cat([x_left, y_lr[:N_b]], dim=1), torch.cat([x_right, y_lr[N_b:]], dim=1)
+        
+        X_bc = torch.cat([bc_top, bc_bottom, bc_left, bc_right], dim=0)
+        u_bc_true = torch.zeros(params['N_bc'], 1, device=DEVICE)
+        
+        # Mini-batch iteration (consistent with Black-Scholes version)
+        num_batches = max(1, params['N_interior'] // params['batch_size'])
+        perm_interior = torch.randperm(params['N_interior'], device=DEVICE)
+        perm_bc = torch.randperm(params['N_bc'], device=DEVICE)
+        
+        epoch_loss = 0.0
+        avg_martingale_loss = 0.0  # To average martingale loss over batches
+        num_mi_batches = 0
+        for b in range(num_batches):
+            start_idx = b * params['batch_size']
+            end_idx = min(start_idx + params['batch_size'], params['N_interior'])
+            batch_size_actual = end_idx - start_idx
+            idx_interior = perm_interior[start_idx:end_idx]
+            
+            start_bc = (b * params['batch_size']) % params['N_bc']
+            idx_bc = perm_bc[start_bc : start_bc + batch_size_actual]
+            if len(idx_bc) < batch_size_actual:
+                extra = batch_size_actual - len(idx_bc)
+                idx_bc = torch.cat([idx_bc, perm_bc[:extra]])
+            
+            x_pde_batch = x_pde[idx_interior]
+            y_pde_batch = y_pde[idx_interior]
+            X_bc_batch = X_bc[idx_bc]
+            u_bc_batch = u_bc_true[idx_bc]
+            
+            optimizer.zero_grad()
+            
+            # PDE Loss
+            x_pde_batch.requires_grad = True
+            y_pde_batch.requires_grad = True
+            pde_residual = compute_pde_residual(model, x_pde_batch, y_pde_batch)
+            loss_pde = torch.mean(pde_residual**2)
+            
+            # Boundary Condition Loss
+            u_pred_bc = model(X_bc_batch)
+            loss_bc = torch.mean((u_pred_bc - u_bc_batch)**2)
+            
+            total_loss = loss_pde + params['lambda_bc'] * loss_bc
+            
+            # Add Martingale-based Monte Carlo Constraint for MI-PINN
+            loss_martingale = torch.tensor(0.0, device=DEVICE)
+            if model_type == 'MI-PINN' and (epoch + 1) % params['mc_every'] == 0:  # Call MC every 'mc_every' epochs
+                batch_mc = min(batch_size_actual, params['N_mc'] // num_batches)
+                x_mc = torch.rand(batch_mc, 1, device=DEVICE)
+                y_mc = torch.rand(batch_mc, 1, device=DEVICE)
+                X_mc = torch.cat([x_mc, y_mc], dim=1)
+                
+                u_pinn_mc = model(X_mc)
+                u_true_mc = poisson_monte_carlo_solver(X_mc, params['mc_paths'], 
+                                                     params['mc_max_steps'], params['mc_dt'])
+                
+                loss_martingale = torch.mean((u_pinn_mc - u_true_mc)**2)
+                total_loss += params['lambda_martingale'] * loss_martingale
+                avg_martingale_loss += loss_martingale.item()
+                num_mi_batches += 1
+            
+            total_loss.backward()
+            optimizer.step()
+            epoch_loss += total_loss.item()
+        
+        epoch_loss /= num_batches
+        if num_mi_batches > 0:
+            avg_martingale_loss /= num_mi_batches
+        loss_history.append(epoch_loss)
+        
+        if scheduler is not None:
+            scheduler.step()
+        
+        if (epoch + 1) % 10 == 0:  # Log every 10 epochs for immediate feedback
+            elapsed = time.time() - start_time
+            log_msg = f"Epoch [{epoch+1}/{params['epochs']}], Loss: {epoch_loss:.6f}, Time={elapsed:.2f}s"
+            if model_type == 'MI-PINN' and num_mi_batches > 0:
+                log_msg += f", Avg Martingale Loss: {avg_martingale_loss:.6f}"
+            logger.info(log_msg)
+        
+        logger.info(f"Finished epoch {epoch+1}/{params['epochs']} for {model_type}")
+    
+    end_time = time.time()
+    training_time = end_time - start_time
+    logger.info(f"-- training finished, training time: {training_time:.2f} --")
+    return model, loss_history, training_time
+
+if __name__ == '__main__':
+    # Further adjusted parameters: faster, with MC every 5 epochs
+    shared_params = {
+        'hidden_dim': 32, 'layers': 4,  
+        'lr': 1e-3, 'epochs': 1000, 'batch_size': 512,  
+        'use_scheduler': True,
+        'lambda_bc': 100.0,
+        'lambda_martingale': 1.0, 
+        'N_interior': 2000,  
+        'N_bc': 1000,  
+        'N_mc': 500,  
+        'mc_paths': 10,  
+        'mc_max_steps': 100,  
+        'mc_dt': 1e-2,  
+        'mc_every': 5  
+    }
+    
+    logger.info("Starting MI-PINN Training and Evaluation for Poisson Equation (MC-based)")
+    logger.info(f"Parameters: {shared_params}")
+    
+    # Train both models with identical frameworks
+    std_pinn_model, std_loss_hist, std_time = train_model('PINN', shared_params)
+    mi_pinn_model, mi_loss_hist, mi_time = train_model('MI-PINN', shared_params)
+    
+    logger.info("\n-- Evaluation --")
+    
+    def analytical_solution_numpy(x, y):
+        return np.sin(np.pi * x) * np.sin(np.pi * y)
+    
+    x_grid_np = np.linspace(0, 1, 100)
+    y_grid_np = np.linspace(0, 1, 100)
+    X_mesh, Y_mesh = np.meshgrid(x_grid_np, y_grid_np)
+    grid_points = torch.tensor(np.stack([X_mesh.flatten(), Y_mesh.flatten()], axis=-1), 
+                              dtype=torch.float32).to(DEVICE)
+    u_true = analytical_solution_numpy(X_mesh, Y_mesh)
+    
+    std_pinn_model.eval()
+    mi_pinn_model.eval()
+    with torch.no_grad():
+        u_pred_std = std_pinn_model(grid_points).cpu().numpy().reshape(X_mesh.shape)
+        u_pred_mi = mi_pinn_model(grid_points).cpu().numpy().reshape(X_mesh.shape)
+    
+    # Calculate all three error metrics
+    error_std = np.linalg.norm(u_pred_std - u_true) / np.linalg.norm(u_true)
+    error_mi = np.linalg.norm(u_pred_mi - u_true) / np.linalg.norm(u_true)
+    mae_std = np.mean(np.abs(u_pred_std - u_true))
+    mae_mi = np.mean(np.abs(u_pred_mi - u_true))
+    mse_std = np.mean((u_pred_std - u_true)**2)
+    mse_mi = np.mean((u_pred_mi - u_true)**2)
+    
+    log_msg_header = "\n" + "="*50
+    log_msg_header += "\n" + " " * 15 + "Comparison"
+    log_msg_header += "\n" + "="*50
+    log_msg_header += f"\n{'Metric':<25} | {'PINN':<15} | {'MI-PINN':<15}"
+    log_msg_header += "\n" + "-"*50
+    logger.info(log_msg_header)
+    
+    log_msg_body = f"{'Training Time (s)':<25} | {std_time:<15.2f} | {mi_time:<15.2f}"
+    log_msg_body += f"\n{'L2 Relative Error':<25} | {error_std:<15.4%} | {error_mi:<15.4%}"
+    log_msg_body += f"\n{'MAE (Mean Absolute Error)':<25} | {mae_std:<15.4e} | {mae_mi:<15.4e}"
+    log_msg_body += f"\n{'MSE (Mean Squared Error)':<25} | {mse_std:<15.4e} | {mse_mi:<15.4e}"
+    log_msg_body += "\n" + "="*50 + "\n"
+    logger.info(log_msg_body)
+    
+    fig = plt.figure(figsize=(18, 16))
+    
+    # 1. Loss comparison
+    ax1 = fig.add_subplot(3, 2, 1)
+    ax1.plot(std_loss_hist, label='PINN Loss')
+    ax1.plot(mi_loss_hist, label='MI-PINN Loss')
+    ax1.set_yscale('log')
+    ax1.set_title('Loss Convergence Comparison')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Total Loss (log scale)')
+    ax1.legend()
+    ax1.grid(True, which="both", ls="--")
+    
+    # 2. Solution slice comparison
+    ax2 = fig.add_subplot(3, 2, 2)
+    y_slice_idx = 50
+    ax2.plot(x_grid_np, u_true[:, y_slice_idx], 'k-', label='Analytical Solution', linewidth=2)
+    ax2.plot(x_grid_np, u_pred_std[:, y_slice_idx], 'r--', label=f'PINN (Err: {error_std:.2%})')
+    ax2.plot(x_grid_np, u_pred_mi[:, y_slice_idx], 'b-.', label=f'MI-PINN (Err: {error_mi:.2%})')
+    ax2.set_title('Solution Slice at y=0.5')
+    ax2.set_xlabel('x')
+    ax2.set_ylabel('u(x, 0.5)')
+    ax2.legend()
+    ax2.grid(True)
+    
+    # 3. Analytical solution surface
+    ax_true = fig.add_subplot(3, 2, 3, projection='3d')
+    ax_true.plot_surface(X_mesh, Y_mesh, u_true, cmap='viridis')
+    ax_true.set_title('Analytical Solution Surface')
+    ax_true.set_xlabel('x')
+    ax_true.set_ylabel('y')
+    ax_true.set_zlabel('u(x,y)')
+    
+    # 4. MI-PINN prediction surface
+    ax_mi = fig.add_subplot(3, 2, 4, projection='3d')
+    ax_mi.plot_surface(X_mesh, Y_mesh, u_pred_mi, cmap='viridis')
+    ax_mi.set_title('MI-PINN Predicted Solution')
+    ax_mi.set_xlabel('x')
+    ax_mi.set_ylabel('y')
+    ax_mi.set_zlabel('u(x,y)')
+    
+    # 5. Error surfaces
+    max_error = max(np.max(np.abs(u_pred_std - u_true)), np.max(np.abs(u_pred_mi - u_true)))
+    
+    ax3 = fig.add_subplot(3, 2, 5, projection='3d')
+    p1 = ax3.plot_surface(X_mesh, Y_mesh, np.abs(u_pred_std - u_true), cmap='hot', vmin=0, vmax=max_error)
+    ax3.set_title('PINN Absolute Error')
+    ax3.set_xlabel('x')
+    ax3.set_ylabel('y')
+    ax3.set_zlabel('Error')
+    fig.colorbar(p1, ax=ax3, fraction=0.046, pad=0.04)
+    
+    ax4 = fig.add_subplot(3, 2, 6, projection='3d')
+    p2 = ax4.plot_surface(X_mesh, Y_mesh, np.abs(u_pred_mi - u_true), cmap='hot', vmin=0, vmax=max_error)
+    ax4.set_title('MI-PINN Absolute Error')
+    ax4.set_xlabel('x')
+    ax4.set_ylabel('y')
+    ax4.set_zlabel('Error')
+    fig.colorbar(p2, ax=ax4, fraction=0.046, pad=0.04)
+    
+    plt.tight_layout()
+    plt.savefig('MI_PINN_Poisson_MC_comparison_results.png', dpi=300)
+    logger.info("Figure saved as: MI_PINN_Poisson_MC_comparison_results.png")
+    
+    logger.info("Training and evaluation completed successfully!")
+    if log_filename:
+        logger.info(f"Log file saved as: {log_filename}")
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+    else:
+        logger.warning("Log file could not be created.")

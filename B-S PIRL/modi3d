@@ -1,0 +1,452 @@
+import time
+import math
+import argparse
+import numpy as np
+import pandas as pd
+from scipy.linalg import cholesky
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+import torch
+import torch.nn as nn
+import torch.multiprocessing as mp
+import sys
+import os
+
+# Shared device and seed settings
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+
+# Shared PIRL model definition
+class PIRL(nn.Module):
+    """Physics-Informed Residual Learning model with residual architecture"""
+    def __init__(self, input_dim, hidden_dim, output_dim=1, layers=6):
+        super(PIRL, self).__init__()
+        self.layers = nn.ModuleList()
+        self.layers.append(nn.Linear(input_dim, hidden_dim))
+        for _ in range(layers - 2):
+            self.layers.append(nn.Linear(hidden_dim + input_dim, hidden_dim))
+        self.layers.append(nn.Linear(hidden_dim, output_dim))
+        self.activation = nn.Tanh()
+        self.apply(self.init_weights)
+    
+    def init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            fan_in = m.in_features
+            fan_out = m.out_features
+            std = math.sqrt(2 / (fan_in + fan_out))
+            torch.nn.init.normal_(m.weight, mean=0.0, std=std)
+            m.weight.data = torch.clamp(m.weight.data, min=-2*std, max=2*std)
+            if m.bias is not None:
+                m.bias.data.zero_()
+    
+    def forward(self, x):
+        original_input = x
+        x = self.layers[0](x)
+        x = self.activation(x)
+        for i in range(1, len(self.layers) - 1):
+            x_concat = torch.cat([x, original_input], dim=1)
+            update = self.layers[i](x_concat)
+            update = self.activation(update)
+            x = x + update  # Residual connection
+        output = self.layers[-1](x)
+        return output
+
+# Shared MinCallPINN wrapper, parameterized for hidden_dim_exp and layers_offset
+class MinCallPINN:
+    """PINN for n-dimensional Min-Call option pricing"""
+    def __init__(self, n, sigma, rho, r=0.05, T=1.0, K=1.0, S_min=0.5, S_max=1.5, hidden_dim_exp=3, layers_offset=3):
+        self.n = n
+        self.sigma = torch.tensor(sigma, dtype=torch.float32, device=device)
+        self.rho = torch.tensor(rho, dtype=torch.float32, device=device)
+        self.r = r
+        self.T = T
+        self.K = K
+        self.S_min = S_min
+        self.S_max = S_max
+        
+        hidden_dim = 2 ** (n + hidden_dim_exp)
+        layers = n + layers_offset
+        input_dim = n + 1  # [S1,...,Sn, t]
+        
+        self.model = PIRL(input_dim=input_dim, hidden_dim=hidden_dim, layers=layers).to(device)
+        print(f"[{os.getpid()}] PIRL Model: input_dim={input_dim}, hidden_dim={hidden_dim}, layers={layers}")
+    
+    def predict_option_price(self, S_values, t_values):
+        """Predict option prices for given S and t arrays"""
+        self.model.eval()
+        with torch.no_grad():
+            if isinstance(S_values, np.ndarray):
+                S_tensor = torch.tensor(S_values, dtype=torch.float32, device=device)
+            else:
+                S_tensor = S_values
+            if isinstance(t_values, np.ndarray):
+                t_tensor = torch.tensor(t_values, dtype=torch.float32, device=device).reshape(-1, 1)
+            else:
+                t_tensor = t_values.reshape(-1, 1)
+            
+            St = torch.cat([S_tensor, t_tensor], dim=1)
+            prices = self.model(St).cpu().numpy().flatten()
+            return prices
+    
+    def pde_loss(self, S, t):
+        """Compute PDE residual loss"""
+        S = S.clone().detach().requires_grad_(True)
+        t = t.clone().detach().requires_grad_(True)
+        St = torch.cat([S, t], dim=1)
+        
+        V = self.model(St)
+        
+        V_t = torch.autograd.grad(V, t, grad_outputs=torch.ones_like(V),
+                                  create_graph=True, retain_graph=True)[0]
+        V_S = torch.autograd.grad(V, S, grad_outputs=torch.ones_like(V),
+                                 create_graph=True, retain_graph=True)[0]
+        
+        V_SS = torch.zeros(S.shape[0], self.n, self.n, device=device, dtype=torch.float32)
+        for i in range(self.n):
+            V_S_i = V_S[:, i]
+            V_SS_i = torch.autograd.grad(V_S_i, S, grad_outputs=torch.ones_like(V_S_i),
+                                         create_graph=True, retain_graph=True)[0]
+            V_SS[:, i, :] = V_SS_i
+        
+        drift_term = torch.sum(self.r * S * V_S, dim=1)
+        diffusion_term = torch.zeros_like(drift_term)
+        for i in range(self.n):
+            for j in range(self.n):
+                diffusion_term += 0.5 * self.rho[i, j] * self.sigma[i] * self.sigma[j] * \
+                                  S[:, i] * S[:, j] * V_SS[:, i, j]
+        
+        pde_residual = V_t.squeeze() + drift_term + diffusion_term - self.r * V.squeeze()
+        return torch.mean(pde_residual ** 2)
+    
+    def bc_loss(self, S_bc, t_bc):
+        """Terminal payoff condition loss"""
+        St = torch.cat([S_bc, t_bc], dim=1)
+        V_pred = self.model(St).squeeze()
+        min_vals, _ = torch.min(S_bc, dim=1, keepdim=True)
+        payoff = torch.relu(min_vals.squeeze() - self.K)
+        mse = torch.mean((V_pred - payoff) ** 2)
+        mae = torch.mean(torch.abs(V_pred - payoff))
+        return mse, mae
+    
+    def train(self, epochs, batch_size=512, use_scheduler=True, lr=1e-3):
+        """Mini-batch training with dynamic sampling and optional LR scheduler.
+        Returns total training time (seconds).
+        """
+        self.model.train()
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        scheduler = None
+        if use_scheduler:
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.7)
+
+        start = time.time()
+        print(f"[{os.getpid()}] Starting training for {self.n}D Black-Scholes PINN...")
+        print(f"[{os.getpid()}] Epoch: Loss, LR, Time(s)")
+        
+        for epoch in range(epochs):
+            # Dynamic sampling each epoch
+            N_interior, N_bc = 10000 * self.n, 2000 * self.n
+            S_interior = (torch.rand(N_interior, self.n, device=device) * (self.S_max - self.S_min)) + self.S_min
+            t_interior = torch.rand(N_interior, 1, device=device) * self.T
+            
+            S_bc = (torch.rand(N_bc, self.n, device=device) * (self.S_max - self.S_min)) + self.S_min
+            t_bc = torch.full((N_bc, 1), self.T, device=device)
+
+            # mini-batch iteration
+            num_batches = max(1, N_interior // batch_size)
+            perm_interior = torch.randperm(N_interior, device=device)
+            perm_bc = torch.randperm(N_bc, device=device)
+
+            epoch_loss = 0.0
+            for b in range(num_batches):
+                start_idx = b * batch_size
+                end_idx = min(start_idx + batch_size, N_interior)
+                batch_size_actual = end_idx - start_idx
+        
+                idx_interior = perm_interior[start_idx:end_idx]
+                
+                start_bc = (b * batch_size) % N_bc
+                idx_bc = perm_bc[start_bc : start_bc + batch_size_actual]
+                if len(idx_bc) < batch_size_actual:
+                    extra = batch_size_actual - len(idx_bc)
+                    idx_bc = torch.cat([idx_bc, perm_bc[:extra]])
+
+                S_int_batch = S_interior[idx_interior]
+                t_int_batch = t_interior[idx_interior]
+                S_bc_batch = S_bc[idx_bc]
+                t_bc_batch = t_bc[idx_bc]
+
+                optimizer.zero_grad()
+                loss_pde = self.pde_loss(S_int_batch, t_int_batch)
+                mse_bc, _ = self.bc_loss(S_bc_batch, t_bc_batch)
+                loss = loss_pde + 2.0 * mse_bc
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+
+            if scheduler is not None:
+                scheduler.step()
+
+            if epoch % 2000 == 0 or epoch == epochs - 1:
+                elapsed = time.time() - start
+                lr_now = optimizer.param_groups[0]['lr']
+                print(f"[{os.getpid()}] Epoch {epoch:6d}: Loss={epoch_loss/num_batches:.4e}, LR={lr_now:.2e}, Time={elapsed:.2f}s")
+        
+        return time.time() - start
+
+# Monte Carlo price simulation for min-call option (for 3D comparison)
+def mc_min_call_price(S0, sigma, rho, r, K, tau, n_steps=252, n_sims=1000000):
+    """Monte Carlo simulation for min-call option price"""
+    n = len(S0)
+    dt = tau / n_steps
+    chol = cholesky(rho, lower=True)
+    S = np.full((n_sims, n), S0)
+    for _ in range(n_steps):
+        dW = np.random.normal(0, np.sqrt(dt), (n_sims, n))
+        dW_cor = np.dot(dW, chol.T)
+        S = S * np.exp((r - 0.5 * sigma**2) * dt + sigma * dW_cor)
+    min_S = np.min(S, axis=1)
+    payoff = np.maximum(min_S - K, 0)
+    price = np.exp(-r * tau) * np.mean(payoff)
+    return price
+
+# Compute PDE residuals using PIRL (for 3D)
+def compute_pde_residuals_pirl_original(model, S_test, t_test, sigma, rho, r, n):
+    """Compute PDE residuals using original PIRL method"""
+    model.eval()
+    S = torch.tensor(S_test, dtype=torch.float32, device=device, requires_grad=True)
+    t = torch.tensor(t_test, dtype=torch.float32, device=device, requires_grad=True).reshape(-1, 1)
+    St = torch.cat([S, t], dim=1)
+    V = model(St)
+
+    V_t = torch.autograd.grad(V, t, grad_outputs=torch.ones_like(V),
+                              create_graph=True, retain_graph=True)[0]
+    V_S = torch.autograd.grad(V, S, grad_outputs=torch.ones_like(V),
+                              create_graph=True, retain_graph=True)[0]
+
+    V_SS = torch.zeros(S.shape[0], n, n, device=device)
+    for i in range(n):
+        V_S_i = V_S[:, i]
+        V_SS_i = torch.autograd.grad(V_S_i, S, grad_outputs=torch.ones_like(V_S_i),
+                                     create_graph=True, retain_graph=True)[0]
+        V_SS[:, i, :] = V_SS_i
+
+    drift_term = torch.sum(r * S * V_S, dim=1)
+    diffusion_term = torch.zeros_like(drift_term)
+    for i in range(n):
+        for j in range(n):
+            diffusion_term += 0.5 * rho[i, j] * sigma[i] * sigma[j] * \
+                              S[:, i] * S[:, j] * V_SS[:, i, j]
+
+    residual = V_t.squeeze() + drift_term + diffusion_term - r * V.squeeze()
+    return residual.detach().cpu().numpy()
+
+# Compute PDE residuals using MC finite difference (for 3D)
+def compute_pde_residuals_mc_fd(n_assets, sigma, rho, r, K, S_points, t_points, T, mc_steps=252, mc_fd_sims=1000000, eps_S=1e-4, eps_t=1e-4):
+    """Compute PDE residuals using Monte Carlo finite difference"""
+    def mc_price(S, tau):
+        return mc_min_call_price(S, sigma, rho, r, K, tau, mc_steps, mc_fd_sims)
+
+    residuals = np.zeros(len(S_points))
+    for idx in range(len(S_points)):
+        S0 = S_points[idx].astype(float).copy()
+        tau = float(T - t_points[idx])
+        if tau <= 0:
+            residuals[idx] = 0
+            continue
+        V0 = mc_price(S0, tau)
+
+        # time derivative
+        V_t_plus = mc_price(S0, max(1e-12, tau + eps_t))
+        V_t_minus = mc_price(S0, max(1e-12, tau - eps_t))
+        V_t = (V_t_plus - V_t_minus) / (2 * eps_t)
+
+        # spatial derivatives
+        V_S = np.zeros(n_assets)
+        V_SS = np.zeros((n_assets, n_assets))
+        for i in range(n_assets):
+            S_plus, S_minus = S0.copy(), S0.copy()
+            S_plus[i] += eps_S
+            S_minus[i] = max(1e-12, S_minus[i] - eps_S)
+            V_plus = mc_price(S_plus, tau)
+            V_minus = mc_price(S_minus, tau)
+            V_S[i] = (V_plus - V_minus) / (2 * eps_S)
+            V_SS[i, i] = (V_plus - 2*V0 + V_minus) / (eps_S**2)
+
+        drift = r * np.sum(S0 * V_S)
+        diffusion = 0.0
+        for i in range(n_assets):
+            for j in range(n_assets):
+                diffusion += 0.5 * rho[i, j] * sigma[i] * sigma[j] * S0[i] * S0[j] * V_SS[i, j]
+
+        residuals[idx] = V_t + drift + diffusion - r * V0
+    return residuals
+
+# Create 3D comparison plots (for 3D configs)
+# #############################################################################
+# # MODIFICATION 1: Add 'prefix' to the function arguments to create unique filenames
+# #############################################################################
+def create_3d_comparison_plots(prefix, pirl_model, n, sigma, rho, r, T, K):
+    """Create 3D comparison plots for PIRL vs MC"""
+    # Assuming n==3, generate grid
+    num_points = 20
+    S1 = np.linspace(0.5, 1.5, num_points)
+    S2 = np.linspace(0.5, 1.5, num_points)
+    S3 = np.linspace(0.5, 1.5, num_points)
+    t = np.full(num_points**3, 0.5)  # Example t=0.5
+    S_grid = np.meshgrid(S1, S2, S3)
+    S_flat = np.column_stack([S_grid[0].ravel(), S_grid[1].ravel(), S_grid[2].ravel()])
+
+    # PIRL prices
+    pirl_prices = pirl_model.predict_option_price(S_flat, t)
+
+    # MC prices (simplified, in practice use full MC)
+    mc_prices = np.array([mc_min_call_price(S, sigma, rho, r, K, T - 0.5) for S in S_flat])  # Placeholder
+
+    # Compute MAE, MSE
+    mae = np.mean(np.abs(pirl_prices - mc_prices))
+    mse = np.mean((pirl_prices - mc_prices)**2)
+
+    # Plot (save to file)
+    fig = plt.figure(figsize=(12, 6))
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax1.scatter(S_flat[:,0], S_flat[:,1], pirl_prices, c='r', label='PIRL')
+    ax1.set_title('PIRL Prices')
+    ax2 = fig.add_subplot(122, projection='3d')
+    ax2.scatter(S_flat[:,0], S_flat[:,1], mc_prices, c='b', label='MC')
+    ax2.set_title('MC Prices')
+    
+    # #############################################################################
+    # # MODIFICATION 2: Use the 'prefix' to save a unique PNG file for each task
+    # #############################################################################
+    png_filename = f"{prefix}_pirl_vs_mc_3d_comparison.png"
+    plt.savefig(png_filename)
+    plt.close()
+
+    return mae, mse, png_filename
+
+# Main comparison function for 3D configs
+def compare_methods_with_plots(prefix, n=3, sigma=None, rho=None, r=0.05, T=1.0, K=1.0, S0=None, 
+                               pirl_epochs=None, mc_steps=252, mc_fd_sims=1000000, 
+                               batch_size=512, use_scheduler=True, create_plots=True, hidden_dim_exp=2, layers_offset=3):
+    if sigma is None:
+        sigma = [0.2] * n
+    if rho is None:
+        rho = np.ones((n, n)) * 0.5
+        np.fill_diagonal(rho, 1.0)
+    if S0 is None:
+        S0 = [1.0] * n
+    if pirl_epochs is None:
+        pirl_epochs = 10000 * n
+
+    sigma = np.array(sigma)
+    rho = np.array(rho)
+    S0 = np.array(S0)
+
+    pid = os.getpid()
+    print(f"[{pid}] {prefix} =========================================================")
+    print(f"[{pid}] {prefix} Enhanced Comparison: PIRL vs Monte Carlo, {n}D Min-Call Option")
+    print(f"[{pid}] {prefix} Parameters: r={r}, sigma={sigma}, T={T}, K={K}")
+    print(f"[{pid}] {prefix} Use scheduler: {use_scheduler}, batch_size: {batch_size}, pirl_epochs: {pirl_epochs}")
+    print(f"[{pid}] {prefix} =========================================================")
+
+    # Step 1: Train PIRL
+    print(f"[{pid}] {prefix} --- Step 1: Training PIRL Model ---")
+    pirl_model = MinCallPINN(n, sigma, rho, r, T, K, hidden_dim_exp=hidden_dim_exp, layers_offset=layers_offset)
+    train_time = pirl_model.train(pirl_epochs, batch_size=batch_size, use_scheduler=use_scheduler)
+
+    # Step 2: Create comparison plots if requested and n=3
+    mae_price, mse_price, png_name = None, None, None
+    if create_plots and n == 3:
+        # #############################################################################
+        # # MODIFICATION 3: Pass 'prefix' to the plotting function
+        # #############################################################################
+        mae_price, mse_price, png_name = create_3d_comparison_plots(prefix, pirl_model, n, sigma, rho, r, T, K)
+    elif create_plots and n != 3:
+        print(f"[{pid}] {prefix} Plotting currently only supported for n=3, skipping plots for n={n}")
+
+    # Step 3: PDE residual comparison
+    print(f"[{pid}] {prefix} --- Step 3: PDE Residual Comparison ---")
+    N_test_residual = 100
+    np.random.seed(456)
+    tau_test = np.random.uniform(0.1, T, [N_test_residual, 1])
+    t_test = T - tau_test
+    S_test = np.random.uniform(0.5, 1.5, [N_test_residual, n])
+
+    # PIRL PDE residuals
+    start_pirl = time.time()
+    pirl_residuals = compute_pde_residuals_pirl_original(pirl_model.model, S_test, t_test, sigma, rho, r, n)
+    pirl_residual_time = time.time() - start_pirl
+    mae_pirl = np.mean(np.abs(pirl_residuals))
+    mse_pirl = np.mean(pirl_residuals**2)
+
+    # MC PDE residuals
+    start_mc = time.time()
+    mc_residuals = compute_pde_residuals_mc_fd(n, sigma, rho, r, K, S_test, t_test, T, mc_steps, mc_fd_sims)
+    mc_residual_time = time.time() - start_mc
+    mae_mc = np.mean(np.abs(mc_residuals))
+    mse_mc = np.mean(mc_residuals**2)
+
+    # Output results
+    print(f"[{pid}] {prefix} PIRL PDE Residuals: MAE={mae_pirl:.6e}, MSE={mse_pirl:.6e}, Time={pirl_residual_time:.2f}s")
+    print(f"[{pid}] {prefix} MC   PDE Residuals: MAE={mae_mc:.6e}, MSE={mse_mc:.6e}, Time={mc_residual_time:.2f}s")
+    print(f"[{pid}] {prefix} PIRL Training Time: {train_time:.2f}s")
+
+    # Save PDE residual results
+    df_residuals = pd.DataFrame({
+        't': t_test.flatten(),
+        **{f"S{i+1}": S_test[:, i] for i in range(n)},
+        'PIRL_PDE_Residual': pirl_residuals,
+        'MC_PDE_Residual': mc_residuals
+    })
+    csv_name = f"{prefix}_pde_residuals_{n}D.csv"
+    df_residuals.to_csv(csv_name, index=False)
+
+    log_name = f"{prefix}_enhanced_comparison_{n}D.log"
+    with open(log_name, "w") as f:
+        f.write(f"=== Enhanced {n}D Min-Call Option Comparison ===\n")
+        f.write(f"PIRL Training Time: {train_time:.2f}s\n")
+        f.write(f"PIRL Residual Calculation Time: {pirl_residual_time:.2f}s\n")
+        f.write(f"MC Residual Calculation Time: {mc_residual_time:.2f}s\n")
+        f.write(f"PIRL PDE Residuals: MAE={mae_pirl:.6e}, MSE={mse_pirl:.6e}\n")
+        f.write(f"MC PDE Residuals: MAE={mae_mc:.6e}, MSE={mse_mc:.6e}\n")
+        if mae_price is not None:
+            f.write(f"Price Comparison: MAE={mae_price:.6f}, MSE={mse_price:.6f}\n")
+        f.write(f"PDE Residuals CSV: {csv_name}\n")
+        if png_name:
+            # #############################################################################
+            # # MODIFICATION 4: Log the unique PNG filename
+            # #############################################################################
+            f.write(f"Plots saved to: {png_name}\n")
+    
+    print(f"[{pid}] {prefix} Detailed residuals saved to {csv_name}")
+    print(f"[{pid}] {prefix} Log saved to {log_name}")
+    
+    return pirl_model
+
+# Process function: Run one configuration
+def run_config(config):
+    # This function is simplified as we are only running 3D tasks now.
+    prefix, dim, hidden_dim_exp, layers_offset = config
+    compare_methods_with_plots(prefix, n=dim, hidden_dim_exp=hidden_dim_exp, layers_offset=layers_offset)
+    print(f"[{os.getpid()}] {prefix} Completed.")
+
+# Main entry point
+if __name__ == "__main__":
+    mp.set_start_method('spawn')
+    
+    configs = [
+        ("3d-1hidden", 3, 2, 3),  # From 3d-1hidden: hidden=2^(3+2)=32, layers=3+3=6
+        ("3d-1layer", 3, 3, 2),   # From 3d-1layer: hidden=2^(3+3)=64, layers=3+2=5
+        ("3d-1both", 3, 2, 2),    # From 3d-1both: hidden=2^(3+2)=32, layers=3+2=5
+    ]
+
+    with mp.Pool(processes=3) as pool:
+        pool.map(run_config, configs)
+
+    print("All configurations completed.")

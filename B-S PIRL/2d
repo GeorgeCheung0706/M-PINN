@@ -1,0 +1,523 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import time
+import os
+from scipy.stats import multivariate_normal
+import math
+
+# Set device to GPU if available, otherwise CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Clear GPU memory
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+class PIRL(nn.Module):
+    def __init__(self, input_dim=3, hidden_dim=32, output_dim=1, layers=5):  # Updated to match nD for n=2
+        super(PIRL, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.layers = nn.ModuleList()
+        self.layers.append(nn.Linear(input_dim, hidden_dim))
+        for _ in range(layers - 2):
+            self.layers.append(nn.Linear(hidden_dim + input_dim, hidden_dim))
+        self.layers.append(nn.Linear(hidden_dim, output_dim))
+        self.activation = nn.Tanh()
+        self.apply(self.init_weights)
+
+    def init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            fan_in = m.in_features
+            fan_out = m.out_features
+            std = math.sqrt(2 / (fan_in + fan_out))
+            torch.nn.init.normal_(m.weight, mean=0.0, std=std)
+            m.weight.data = torch.clamp(m.weight.data, min=-2*std, max=2*std)
+            if m.bias is not None:
+                m.bias.data.zero_()
+
+    def forward(self, x):
+        original_input = x
+        x = self.layers[0](x)
+        x = self.activation(x)
+        for i in range(1, len(self.layers) - 1):
+            x_concat = torch.cat([x, original_input], dim=1)
+            update = self.layers[i](x_concat)
+            update = self.activation(update)
+            x = x + update  # Residual connection
+        output = self.layers[-1](x)
+        return output
+
+def pde_loss(model, S, t, r=0.05, sigma=None, rho=None):
+    """2D Black-Scholes PDE loss"""
+    if sigma is None:
+        sigma = torch.tensor([0.2, 0.2], device=device)
+    if rho is None:
+        rho = torch.tensor([[1.0, 0.5], [0.5, 1.0]], device=device)
+    
+    S.requires_grad_(True)
+    t.requires_grad_(True)
+    St = torch.cat([S, t], dim=1)
+    
+    V = model(St)
+    
+    V_t = torch.autograd.grad(V, t, grad_outputs=torch.ones_like(V),
+                              create_graph=True, retain_graph=True)[0]
+    V_S = torch.autograd.grad(V, S, grad_outputs=torch.ones_like(V),
+                              create_graph=True, retain_graph=True)[0]
+    
+    V_SS = torch.zeros(S.shape[0], 2, 2, device=device, dtype=torch.float32)
+    for j in range(2):
+        V_S_j = V_S[:, j]
+        V_SS_j = torch.autograd.grad(V_S_j, S, grad_outputs=torch.ones_like(V_S_j),
+                                     create_graph=True, retain_graph=True)[0]
+        V_SS[:, j, :] = V_SS_j
+    
+    drift_term = torch.sum(r * S * V_S, dim=1)
+    diffusion_term = torch.zeros_like(drift_term)
+    
+    for j in range(2):
+        for k in range(2):
+            diffusion_term += 0.5 * rho[j, k] * sigma[j] * sigma[k] * \
+                             S[:, j] * S[:, k] * V_SS[:, j, k]
+    
+    pde_residual = V_t.squeeze() + drift_term + diffusion_term - r * V.squeeze()
+    loss = torch.mean(pde_residual ** 2)
+    
+    return loss  
+
+def bc_loss(model, S_bc, t_bc, K=1.0):
+    """Boundary condition loss for 2D min-call option"""
+    St = torch.cat([S_bc, t_bc], dim=1)
+    V_pred = model(St).squeeze()
+    
+    min_vals = torch.min(S_bc, dim=1)[0]  
+    payoff = torch.relu(min_vals - K)
+    
+    mse = torch.mean((V_pred - payoff) ** 2)
+    mae = torch.mean(torch.abs(V_pred - payoff))
+    
+    return mse, mae
+
+def stulz_min_call(V, H, F, tau, R, sigma_V, sigma_H, rho_VH):
+    """Stulz analytical formula for min-call option on two assets"""
+    sigma_sq = sigma_V**2 + sigma_H**2 - 2 * rho_VH * sigma_V * sigma_H
+    if sigma_sq < 0:
+        sigma_sq = 0
+    sigma = np.sqrt(sigma_sq)
+    
+    if sigma_H == 0 or sigma_V == 0 or tau == 0 or sigma == 0:
+        payoff = np.maximum(np.minimum(V, H) - F, 0)
+        return payoff * np.exp(-R * tau)
+    
+    gamma1 = (np.log(H / F) + (R - 0.5 * sigma_H**2) * tau) / (sigma_H * np.sqrt(tau))
+    gamma2 = (np.log(V / F) + (R - 0.5 * sigma_V**2) * tau) / (sigma_V * np.sqrt(tau))
+    
+    a1 = gamma1 + sigma_H * np.sqrt(tau)
+    b1 = (np.log(V / H) - 0.5 * sigma_sq * tau) / (sigma * np.sqrt(tau))
+    rho1 = (rho_VH * sigma_V - sigma_H) / sigma
+    
+    a2 = gamma2 + sigma_V * np.sqrt(tau)
+    b2 = (np.log(H / V) - 0.5 * sigma_sq * tau) / (sigma * np.sqrt(tau))
+    rho2 = (rho_VH * sigma_H - sigma_V) / sigma
+    
+    def N2(x, y, rho):
+        rho = np.clip(rho, -1.0, 1.0)
+        mean = [0, 0]
+        cov = [[1, rho], [rho, 1]]
+        upper_limits = [x, y]
+        return multivariate_normal.cdf(upper_limits, mean=mean, cov=cov)
+    
+    term1 = H * N2(a1, b1, rho1)
+    term2 = V * N2(a2, b2, rho2)
+    term3 = F * np.exp(-R * tau) * N2(gamma1, gamma2, rho_VH)
+    
+    return term1 + term2 - term3
+
+def train_PINN(model, epochs=20000, r=0.05, sigma=None, rho=None, T=1.0, K=1.0,
+               S_min=0.5, S_max=1.5, batch_size=512, use_scheduler=True, lr=1e-3):
+    """Train the PINN model with Adam and mini-batch processing - Optimized to match nD"""
+    if sigma is None:
+        sigma = torch.tensor([0.2, 0.2], device=device)
+    if rho is None:
+        rho = torch.tensor([[1.0, 0.5], [0.5, 1.0]], device=device)
+    
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    if use_scheduler:
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.7)
+    
+    n = 2  # For consistency with nD
+    N_interior, N_bc = 10000 * n, 2000 * n
+    
+    print("Starting training for 2D Black-Scholes PINN with Adam...")
+    print("Epoch: Loss, LR, Time(s)")
+    
+    training_start_time = time.time()
+    
+    for epoch in range(epochs):
+        # Dynamic sampling each epoch
+        S_interior = torch.rand(N_interior, 2, device=device) * (S_max - S_min) + S_min
+        t_interior = torch.rand(N_interior, 1, device=device) * T
+        S_bc = torch.rand(N_bc, 2, device=device) * (S_max - S_min) + S_min
+        t_bc = torch.full((N_bc, 1), T, device=device)
+        
+        # Mini-batch iteration
+        num_batches = max(1, N_interior // batch_size)
+        perm_interior = torch.randperm(N_interior, device=device)
+        perm_bc = torch.randperm(N_bc, device=device)
+        
+        epoch_loss = 0.0
+        for b in range(num_batches):
+            start_idx = b * batch_size
+            end_idx = min(start_idx + batch_size, N_interior)
+            batch_size_actual = end_idx - start_idx
+            idx_interior = perm_interior[start_idx:end_idx]
+            
+            start_bc = (b * batch_size) % N_bc
+            idx_bc = perm_bc[start_bc : start_bc + batch_size_actual]
+            if len(idx_bc) < batch_size_actual:
+                extra = batch_size_actual - len(idx_bc)
+                idx_bc = torch.cat([idx_bc, perm_bc[:extra]])
+            
+            S_int_batch = S_interior[idx_interior]
+            t_int_batch = t_interior[idx_interior]
+            S_bc_batch = S_bc[idx_bc]
+            t_bc_batch = t_bc[idx_bc]
+            
+            optimizer.zero_grad()
+            loss_pde = pde_loss(model, S_int_batch, t_int_batch, r, sigma, rho)
+            mse_bc, _ = bc_loss(model, S_bc_batch, t_bc_batch, K)
+            loss = loss_pde + 2.0 * mse_bc
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()  # Changed to sum, then average by num_batches
+        
+        epoch_loss /= num_batches  # Average loss over batches
+        
+        if use_scheduler:
+            scheduler.step()
+        
+        if epoch % 2000 == 0:
+            elapsed = time.time() - training_start_time
+            lr_now = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch:6d}: Loss={epoch_loss:.4e}, LR={lr_now:.2e}, Time={elapsed:.2f}s")
+    
+    # Removed training_log CSV saving for simplicity, matching nD
+    
+    # Final metrics on last boundary points (kept as in original)
+    mse_bc, mae_bc = bc_loss(model, S_bc, t_bc, K)
+    print(f"Final Metrics: MSE={mse_bc.item():.4e}, MAE={mae_bc.item():.4e}")
+    
+    total_training_time = time.time() - training_start_time
+    print(f"Training completed in {total_training_time:.2f} seconds.")
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return total_training_time
+
+def predict_option_price(model, S1, S2, t):
+    """Predict option price using trained model"""
+    model.eval()
+    with torch.no_grad():
+        S1_tensor = torch.tensor(S1, dtype=torch.float32, device=device).reshape(-1, 1)
+        S2_tensor = torch.tensor(S2, dtype=torch.float32, device=device).reshape(-1, 1)
+        t_tensor = torch.tensor(t, dtype=torch.float32, device=device).reshape(-1, 1)
+        St = torch.cat([S1_tensor, S2_tensor, t_tensor], dim=1)
+        prices = model(St).cpu().numpy().flatten()
+        return prices
+
+def main():
+    # Parameters
+    n = 2
+    r = 0.05
+    sigma = [0.2, 0.25]
+    rho_val = 0.5
+    rho_matrix = np.array([[1.0, rho_val], [rho_val, 1.0]])
+    T = 1.0
+    K = 1.0
+    S_min, S_max = 0.5, 1.5
+    epochs = 20000
+    
+    # Network architecture - Updated to match optimized version
+    input_dim = 3  # [S1, S2, t]
+    hidden_dim = 32
+    layers = 5
+    
+    print("="*80)
+    print("PIRL vs STULZ ANALYTICAL SOLUTION COMPARISON (2D)")
+    print("="*80)
+    print(f"Parameters: r={r}, sigma={sigma}, rho={rho_val}, T={T}, K={K}")
+    print(f"Network: input_dim={input_dim}, hidden_dim={hidden_dim}, layers={layers}")
+    print(f"Training epochs: {epochs}")
+    print("-" * 60)
+    
+    # Convert parameters to tensors
+    sigma_tensor = torch.tensor(sigma, device=device, dtype=torch.float32)
+    rho_tensor = torch.tensor(rho_matrix, device=device, dtype=torch.float32)
+    
+    # Step 1: Train PIRL model
+    print("\n--- Step 1: Training PIRL Model ---")
+    model = PIRL(input_dim=input_dim, hidden_dim=hidden_dim, layers=layers).to(device)
+    training_time = train_PINN(model, epochs, r, sigma_tensor, rho_tensor, T, K, S_min, S_max)
+    
+    # Step 2: Generate test data and compare with timing
+    print("\n--- Step 2: Comparing PIRL vs Stulz Analytical Solution ---")
+    N_test = 1000
+    print(f"Generating {N_test} test points from S1,S2 in [50, 150], t in [0.1, {T}]...")
+    
+    S1_test = np.random.uniform(0.5, 1.5, N_test)
+    S2_test = np.random.uniform(0.5, 1.5, N_test)
+    t_test = np.random.uniform(0.1, T, N_test)
+    tau_test = T - t_test
+    
+    print("\nTiming PIRL predictions...")
+    pirl_start_time = time.time()
+    M_pirl = predict_option_price(model, S1_test, S2_test, t_test)
+    pirl_end_time = time.time()
+    pirl_prediction_time = pirl_end_time - pirl_start_time
+    
+    print("Timing Stulz analytical solutions...")
+    analytical_start_time = time.time()
+    M_analytical = np.array([
+        stulz_min_call(S1_test[i], S2_test[i], K, tau_test[i],
+                      r, sigma[0], sigma[1], rho_val)
+        for i in range(N_test)
+    ])
+    analytical_end_time = time.time()
+    analytical_prediction_time = analytical_end_time - analytical_start_time
+    
+    print("\n--- Timing Comparison ---")
+    print(f"PIRL prediction time: {pirl_prediction_time:.6f} seconds")
+    print(f"Analytical solution time: {analytical_prediction_time:.6f} seconds")
+    print(f"Time per prediction - PIRL: {pirl_prediction_time/N_test*1000:.6f} ms/prediction")
+    print(f"Time per prediction - Analytical: {analytical_prediction_time/N_test*1000:.6f} ms/prediction")
+    
+    if pirl_prediction_time > analytical_prediction_time:
+        speedup_factor = pirl_prediction_time / analytical_prediction_time
+        print(f"Analytical solution is {speedup_factor:.2f}x faster than PIRL")
+    else:
+        speedup_factor = analytical_prediction_time / pirl_prediction_time
+        print(f"PIRL is {speedup_factor:.2f}x faster than analytical solution")
+    
+    results_df = pd.DataFrame({
+        'S1': S1_test,
+        'S2': S2_test,
+        't': t_test,
+        'tau': tau_test,
+        'PIRL_Price': M_pirl,
+        'Analytical_Price': M_analytical
+    })
+    
+    results_df['Abs_Error'] = np.abs(results_df['PIRL_Price'] - results_df['Analytical_Price'])
+    results_df['Rel_Error_Percent'] = (results_df['Abs_Error'] / 
+                                      (results_df['Analytical_Price'] + 1e-8)) * 100
+    
+    results_df.to_csv("pirl_vs_stulz_2d_results.csv", index=False)
+    
+    timing_info = {
+        'PIRL_Total_Time': pirl_prediction_time,
+        'Analytical_Total_Time': analytical_prediction_time,
+        'PIRL_Time_Per_Prediction_ms': pirl_prediction_time/N_test*1000,
+        'Analytical_Time_Per_Prediction_ms': analytical_prediction_time/N_test*1000,
+        'Number_of_Predictions': N_test
+    }
+    
+    timing_df = pd.DataFrame([timing_info])
+    timing_df.to_csv("pirl_vs_stulz_2d_timing.csv", index=False)
+    
+    print("Detailed test results saved to 'pirl_vs_stulz_2d_results.csv'")
+    print("Timing information saved to 'pirl_vs_stulz_2d_timing.csv'")
+    
+    print("\n--- Step 3: Error Metrics ---")
+    print("\n[Metrics for ALL test points]")
+    mae_all = np.mean(results_df['Abs_Error'])
+    mse_all = np.mean(np.square(results_df['Abs_Error']))
+    mape_all = np.mean(results_df['Rel_Error_Percent'])
+    
+    print(f"Mean Absolute Error (MAE): {mae_all:.6f}")
+    print(f"Mean Squared Error (MSE): {mse_all:.6f}")
+    print(f"Mean Absolute Percentage Error (MAPE): {mape_all:.2f}%")
+    
+    threshold = 0.01
+    meaningful_results = results_df[results_df['Analytical_Price'] >= threshold]
+    
+    print(f"\n[Metrics for 'meaningful' points (Analytical Price >= ${threshold:.2f})]")
+    if not meaningful_results.empty:
+        mae_meaningful = np.mean(meaningful_results['Abs_Error'])
+        mse_meaningful = np.mean(np.square(meaningful_results['Abs_Error']))
+        mape_meaningful = np.mean(meaningful_results['Rel_Error_Percent'])
+        
+        print(f"Found {len(meaningful_results)} meaningful points out of {N_test}.")
+        print(f"MAE on meaningful points: {mae_meaningful:.6f}")
+        print(f"MSE on meaningful points: {mse_meaningful:.6f}")
+        print(f"MAPE on meaningful points: {mape_meaningful:.2f}%")
+    else:
+        print(f"No options with price >= {threshold}. MAPE not computable.")
+    
+    print("\n--- Step 4: Generating Plots ---")
+    
+    t_plot = np.linspace(0.01, T, 100)
+    S1_fixed, S2_fixed = [0.95, 1.10], [1.05, 1.00]
+    
+    plt.figure(figsize=(15, 10))
+    
+    plt.subplot(2, 3, 1)
+    colors = ['blue', 'red']
+    linestyles = ['--', '-']
+    markers = ['o', 's']
+    
+    for i in range(2):
+        S1_val, S2_val = S1_fixed[i], S2_fixed[i]
+        tau_plot = T - t_plot
+        
+        M_pirl_curve = predict_option_price(model,
+                                           np.full_like(t_plot, S1_val),
+                                           np.full_like(t_plot, S2_val),
+                                           t_plot)
+        
+        M_ana_curve = np.array([
+            stulz_min_call(S1_val, S2_val, K, tau_plot[j],
+                          r, sigma[0], sigma[1], rho_val)
+            for j in range(len(tau_plot))
+        ])
+        
+        plt.plot(t_plot, M_pirl_curve, color=colors[i], linestyle=linestyles[0],
+                linewidth=2, marker=markers[i], markevery=20,
+                label=f'PIRL (S1={S1_val}, S2={S2_val})')
+        plt.plot(t_plot, M_ana_curve, color=colors[i], linestyle=linestyles[1],
+                linewidth=2, label=f'Stulz (S1={S1_val}, S2={S2_val})')
+    
+    plt.xlabel('Time t', fontsize=12)
+    plt.ylabel('Option Price', fontsize=12)
+    plt.title('PIRL vs Stulz: Option Price vs Time', fontsize=13)
+    plt.legend(fontsize=9)
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(2, 3, 2)
+    plt.hist(results_df['Abs_Error'], bins=50, alpha=0.7, edgecolor='black')
+    plt.xlabel('Absolute Error', fontsize=12)
+    plt.ylabel('Frequency', fontsize=12)
+    plt.title('Distribution of Absolute Errors', fontsize=13)
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(2, 3, 3)
+    plt.scatter(results_df['Analytical_Price'], results_df['PIRL_Price'],
+               alpha=0.6, s=10)
+    min_price = min(results_df['Analytical_Price'].min(), results_df['PIRL_Price'].min())
+    max_price = max(results_df['Analytical_Price'].max(), results_df['PIRL_Price'].max())
+    plt.plot([min_price, max_price], [min_price, max_price], 'r--', linewidth=2)
+    plt.xlabel('Stulz Analytical Price', fontsize=12)
+    plt.ylabel('PIRL Price', fontsize=12)
+    plt.title('PIRL vs Stulz Prices', fontsize=13)
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(2, 3, 4)
+    plt.scatter(results_df['Analytical_Price'], results_df['Rel_Error_Percent'],
+               alpha=0.6, s=10)
+    plt.xlabel('Stulz Analytical Price', fontsize=12)
+    plt.ylabel('Relative Error (%)', fontsize=12)
+    plt.title('Relative Error vs Option Price', fontsize=13)
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(2, 3, 5)
+    methods = ['PIRL', 'Analytical']
+    times = [pirl_prediction_time, analytical_prediction_time]
+    colors_bar = ['skyblue', 'lightcoral']
+    bars = plt.bar(methods, times, color=colors_bar)
+    plt.ylabel('Time (seconds)', fontsize=12)
+    plt.title(f'Prediction Time Comparison\n({N_test} predictions)', fontsize=13)
+    plt.grid(True, alpha=0.3)
+    
+    for bar, time_val in zip(bars, times):
+        plt.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.001,
+                f'{time_val:.4f}s', ha='center', va='bottom', fontsize=10)
+    
+    plt.subplot(2, 3, 6)
+    times_per_pred = [pirl_prediction_time/N_test*1000, analytical_prediction_time/N_test*1000]
+    bars2 = plt.bar(methods, times_per_pred, color=colors_bar)
+    plt.ylabel('Time per Prediction (ms)', fontsize=12)
+    plt.title('Time per Prediction Comparison', fontsize=13)
+    plt.grid(True, alpha=0.3)
+    
+    for bar, time_val in zip(bars2, times_per_pred):
+        plt.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.001,
+                f'{time_val:.4f}ms', ha='center', va='bottom', fontsize=10)
+    
+    plt.tight_layout()
+    plt.savefig("pirl_vs_stulz_2d_comparison.png", dpi=200)
+    plt.show()
+    print("Comparison plot saved to 'pirl_vs_stulz_2d_comparison.png'")
+    
+    print("\n--- Step 5: Creating 3D Surface Plot ---")
+    
+    S1_grid = np.linspace(0.8, 1.2, 30)
+    S2_grid = np.linspace(0.8, 1.2, 30)
+    S1_mesh, S2_mesh = np.meshgrid(S1_grid, S2_grid)
+    t_fixed = 0.5
+    
+    S1_flat = S1_mesh.flatten()
+    S2_flat = S2_mesh.flatten()
+    t_flat = np.full_like(S1_flat, t_fixed)
+    tau_flat = T - t_flat
+    
+    Z_pirl = predict_option_price(model, S1_flat, S2_flat, t_flat).reshape(S1_mesh.shape)
+    Z_analytical = np.array([
+        stulz_min_call(S1_flat[i], S2_flat[i], K, tau_flat[i],
+                      r, sigma[0], sigma[1], rho_val)
+        for i in range(len(S1_flat))
+    ]).reshape(S1_mesh.shape)
+    
+    fig = plt.figure(figsize=(15, 6))
+    
+    ax1 = fig.add_subplot(121, projection='3d')
+    surf1 = ax1.plot_surface(S1_mesh, S2_mesh, Z_pirl, cmap='viridis', alpha=0.8)
+    ax1.set_xlabel('Stock Price S1')
+    ax1.set_ylabel('Stock Price S2')
+    ax1.set_zlabel('Option Price')
+    ax1.set_title(f'PIRL Option Prices (t={t_fixed})')
+    
+    ax2 = fig.add_subplot(122, projection='3d')
+    surf2 = ax2.plot_surface(S1_mesh, S2_mesh, Z_analytical, cmap='viridis', alpha=0.8)
+    ax2.set_xlabel('Stock Price S1')
+    ax2.set_ylabel('Stock Price S2')
+    ax2.set_zlabel('Option Price')
+    ax2.set_title(f'Stulz Analytical Prices (t={t_fixed})')
+    
+    plt.tight_layout()
+    plt.savefig("pirl_vs_stulz_2d_surface.png", dpi=200)
+    plt.show()
+    print("Surface plot saved to 'pirl_vs_stulz_2d_surface.png'")
+    
+    print("\n" + "="*60)
+    print("SUMMARY")
+    print("="*60)
+    print(f"Training time: {training_time:.2f} seconds")
+    print(f"Overall MAE: {mae_all:.6f}")
+    print(f"Overall MSE: {mse_all:.6f}")
+    print(f"Overall MAPE: {mape_all:.2f}%")
+    if not meaningful_results.empty:
+        print(f"Meaningful points MAE: {mae_meaningful:.6f}")
+        print(f"Mean Squared Error (MSE): {mse_all:.6f}")
+        print(f"Meaningful points MAPE: {mape_meaningful:.2f}%")
+    
+    print(f"\nTiming Summary:")
+    print(f"PIRL prediction time: {pirl_prediction_time:.6f} seconds")
+    print(f"Analytical solution time: {analytical_prediction_time:.6f} seconds")
+    print(f"PIRL time per prediction: {pirl_prediction_time/N_test*1000:.6f} ms")
+    print(f"Analytical time per prediction: {analytical_prediction_time/N_test*1000:.6f} ms")
+    
+    if pirl_prediction_time > analytical_prediction_time:
+        speedup_factor = pirl_prediction_time / analytical_prediction_time
+        print(f"Analytical solution is {speedup_factor:.2f}x faster than PIRL")
+    else:
+        speedup_factor = analytical_prediction_time / pirl_prediction_time
+        print(f"PIRL is {speedup_factor:.2f}x faster than analytical solution")
+
+if __name__ == "__main__":
+    main()

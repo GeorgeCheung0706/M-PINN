@@ -1,0 +1,316 @@
+import time
+import math
+import argparse
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+
+# ------- Device & seeds -------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+
+
+# ------- PIRL model definition -------
+class PIRL(nn.Module):
+    """Physics-Informed Residual Learning model with residual architecture"""
+    def __init__(self, input_dim, hidden_dim, output_dim=1, layers=6):
+        super(PIRL, self).__init__()
+        self.layers = nn.ModuleList()
+        self.layers.append(nn.Linear(input_dim, hidden_dim))
+        for _ in range(layers - 2):
+            self.layers.append(nn.Linear(hidden_dim + input_dim, hidden_dim))
+        self.layers.append(nn.Linear(hidden_dim, output_dim))
+        self.activation = nn.Tanh()
+        self.apply(self.init_weights)
+
+    def init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            fan_in = m.in_features
+            fan_out = m.out_features
+            std = math.sqrt(2 / (fan_in + fan_out))
+            torch.nn.init.normal_(m.weight, mean=0.0, std=std)
+            m.weight.data = torch.clamp(m.weight.data, min=-2*std, max=2*std)
+            if m.bias is not None:
+                m.bias.data.zero_()
+
+    def forward(self, x):
+        original_input = x
+        x = self.layers[0](x)
+        x = self.activation(x)
+        for i in range(1, len(self.layers) - 1):
+            x_concat = torch.cat([x, original_input], dim=1)
+            update = self.layers[i](x_concat)
+            update = self.activation(update)
+            x = x + update  # Residual connection
+        output = self.layers[-1](x)
+        return output
+
+
+# ------- MinCallPINN wrapper -------
+class MinCallPINN:
+    """PINN for n-dimensional Min-Call option pricing"""
+    def __init__(self, n, sigma, rho, r=0.05, T=1.0, K=1.0, S_min=0.5, S_max=1.5):
+        self.n = n
+        self.sigma = torch.tensor(sigma, dtype=torch.float32, device=device)
+        self.rho = torch.tensor(rho, dtype=torch.float32, device=device)
+        self.r = r
+        self.T = T
+        self.K = K
+        self.S_min = S_min
+        self.S_max = S_max
+
+        hidden_dim = 2 ** (n + 3)  # 2^(n+3)
+        layers = n + 3
+        input_dim = n + 1  # [S1,...,Sn, t]
+
+        self.model = PIRL(input_dim=input_dim, hidden_dim=hidden_dim, layers=layers).to(device)
+        print(f"PIRL Model: input_dim={input_dim}, hidden_dim={hidden_dim}, layers={layers}")
+
+    def pde_loss(self, S, t):
+        """Compute PDE residual loss"""
+        S = S.clone().detach().requires_grad_(True)
+        t = t.clone().detach().requires_grad_(True)
+        St = torch.cat([S, t], dim=1)
+        V = self.model(St)
+
+        V_t = torch.autograd.grad(V, t, grad_outputs=torch.ones_like(V),
+                                create_graph=True, retain_graph=True)[0]
+        V_S = torch.autograd.grad(V, S, grad_outputs=torch.ones_like(V),
+                                create_graph=True, retain_graph=True)[0]
+
+        V_SS = torch.zeros(S.shape[0], self.n, self.n, device=device, dtype=torch.float32)
+        for i in range(self.n):
+            V_S_i = V_S[:, i]
+            V_SS_i = torch.autograd.grad(V_S_i, S, grad_outputs=torch.ones_like(V_S_i),
+                                       create_graph=True, retain_graph=True)[0]
+            V_SS[:, i, :] = V_SS_i
+
+        drift_term = torch.sum(self.r * S * V_S, dim=1)
+        diffusion_term = torch.zeros_like(drift_term)
+        for i in range(self.n):
+            for j in range(self.n):
+                diffusion_term += 0.5 * self.rho[i, j] * self.sigma[i] * self.sigma[j] * \
+                                S[:, i] * S[:, j] * V_SS[:, i, j]
+
+        pde_residual = V_t.squeeze() + drift_term + diffusion_term - self.r * V.squeeze()
+        return torch.mean(pde_residual ** 2)
+
+    def bc_loss(self, S_bc, t_bc):
+        """Terminal payoff condition loss"""
+        St = torch.cat([S_bc, t_bc], dim=1)
+        V_pred = self.model(St).squeeze()
+        min_vals, _ = torch.min(S_bc, dim=1, keepdim=True)
+        payoff = torch.relu(min_vals.squeeze() - self.K)
+        mse = torch.mean((V_pred - payoff) ** 2)
+        mae = torch.mean(torch.abs(V_pred - payoff))
+        return mse, mae
+
+    def train(self, epochs, batch_size=512, use_scheduler=True, lr=1e-3):
+        """Mini-batch training with dynamic sampling and optional LR scheduler.
+        Returns total training time (seconds).
+        """
+        self.model.train()
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        scheduler = None
+        if use_scheduler:
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.7)
+
+        start = time.time()
+
+        for epoch in range(epochs):
+            # Dynamic sampling each epoch
+            N_interior, N_bc = 10000 * self.n, 2000 * self.n
+            S_interior = (torch.rand(N_interior, self.n, device=device) * (self.S_max - self.S_min)) + self.S_min
+            t_interior = torch.rand(N_interior, 1, device=device) * self.T
+            S_bc = (torch.rand(N_bc, self.n, device=device) * (self.S_max - self.S_min)) + self.S_min
+            t_bc = torch.full((N_bc, 1), self.T, device=device)
+
+            # mini-batch iteration (align BC batches to same index length)
+            num_batches = max(1, N_interior // batch_size)
+            perm_interior = torch.randperm(N_interior, device=device)
+            perm_bc = torch.randperm(N_bc, device=device)
+
+            epoch_loss = 0.0
+            for b in range(num_batches):
+                start_idx = b * batch_size
+                end_idx = start_idx + batch_size
+                idx_interior = perm_interior[start_idx:end_idx]
+                idx_bc = perm_bc[start_idx % N_bc : (start_idx % N_bc) + batch_size]
+                # ensure idx_bc has correct shape
+                if idx_bc.shape[0] < batch_size:
+                    # pad by random sampling
+                    extra = batch_size - idx_bc.shape[0]
+                    idx_bc = torch.cat([idx_bc, perm_bc[:extra]])
+
+                S_int_batch = S_interior[idx_interior]
+                t_int_batch = t_interior[idx_interior]
+                S_bc_batch = S_bc[idx_bc]
+                t_bc_batch = t_bc[idx_bc]
+
+                optimizer.zero_grad()
+                loss_pde = self.pde_loss(S_int_batch, t_int_batch)
+                mse_bc, _ = self.bc_loss(S_bc_batch, t_bc_batch)
+                loss = loss_pde + 2.0 * mse_bc
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+
+            if scheduler is not None:
+                scheduler.step()
+
+            if epoch % 2000 == 0:
+                elapsed = time.time() - start
+                lr_now = optimizer.param_groups[0]['lr']
+                print(f"Epoch {epoch:6d}: Loss={epoch_loss/num_batches:.4e}, LR={lr_now:.2e}, Time={elapsed:.2f}s")
+        
+        return time.time() - start
+
+    def evaluate(self, S_test, t_test):
+        """Evaluate PIRL model on test data"""
+        self.model.eval()
+        with torch.no_grad():
+            S_tensor = torch.tensor(S_test, dtype=torch.float32, device=device)
+            t_tensor = torch.tensor(t_test, dtype=torch.float32, device=device)
+            St = torch.cat([S_tensor, t_tensor], dim=1)
+            V_pred = self.model(St).squeeze()
+            return V_pred.cpu().numpy()
+
+    def compute_pde_residuals(self, S_test, t_test):
+        """Compute PDE residuals for test data"""
+        self.model.eval()
+        S = torch.tensor(S_test, dtype=torch.float32, device=device, requires_grad=True)
+        t = torch.tensor(t_test, dtype=torch.float32, device=device, requires_grad=True)
+        St = torch.cat([S, t], dim=1)
+        V = self.model(St)
+
+        V_t = torch.autograd.grad(V, t, grad_outputs=torch.ones_like(V),
+                                create_graph=True, retain_graph=True)[0]
+        V_S = torch.autograd.grad(V, S, grad_outputs=torch.ones_like(V),
+                                create_graph=True, retain_graph=True)[0]
+
+        N = S.shape[0]
+        V_SS = torch.zeros(N, self.n, self.n, device=device)
+        for i in range(self.n):
+            V_S_i = V_S[:, i]
+            V_SS_i = torch.autograd.grad(V_S_i, S, grad_outputs=torch.ones_like(V_S_i),
+                                       create_graph=True, retain_graph=True)[0]
+            V_SS[:, i, :] = V_SS_i
+
+        drift_term = torch.sum(self.r * S * V_S, dim=1).squeeze()
+        diffusion_term = torch.zeros_like(drift_term)
+        for i in range(self.n):
+            for j in range(self.n):
+                diffusion_term += 0.5 * self.rho[i, j] * self.sigma[i] * self.sigma[j] * \
+                                S[:, i] * S[:, j] * V_SS[:, i, j]
+
+        residual = V_t.squeeze() + drift_term + diffusion_term - self.r * V.squeeze()
+        return residual.detach().cpu().numpy()
+
+
+# ------- Main training function -------
+def train_pirl_model(n, sigma=None, rho=None, r=0.05, T=1.0, K=1.0, S0=None,
+                     pirl_epochs=None, batch_size=512, use_scheduler=True):
+    if sigma is None:
+        sigma = [0.2] * n
+    if rho is None:
+        rho = np.ones((n, n)) * 0.5
+        np.fill_diagonal(rho, 1.0)
+    if S0 is None:
+        S0 = [1.0] * n
+    if pirl_epochs is None:
+        pirl_epochs = 10000 * n
+
+    sigma = np.array(sigma)
+    rho = np.array(rho)
+    S0 = np.array(S0)
+
+    print("="*80)
+    print(f"PIRL Training for {n}D Min-Call Option")
+    print(f"Use scheduler: {use_scheduler}, batch_size: {batch_size}, pirl_epochs: {pirl_epochs}")
+    print("="*80)
+
+    # Train PIRL model
+    pirl_model = MinCallPINN(n, sigma, rho, r, T, K)
+    train_time = pirl_model.train(pirl_epochs, batch_size=batch_size, use_scheduler=use_scheduler)
+
+    # Generate test data for evaluation
+    N_test = 1000
+    np.random.seed(123)
+    tau_test = np.random.uniform(0.1, T, [N_test, 1])
+    t_test = T - tau_test
+    S_test = np.random.uniform(0.5, 1.5, [N_test, n])
+
+    # Evaluate PIRL model
+    start_eval = time.time()
+    V_predictions = pirl_model.evaluate(S_test, t_test)
+    pirl_residuals = pirl_model.compute_pde_residuals(S_test, t_test)
+    eval_time = time.time() - start_eval
+
+    # Compute evaluation metrics
+    mae_pirl = np.mean(np.abs(pirl_residuals))
+    mse_pirl = np.mean(pirl_residuals**2)
+
+    # Output results
+    print(f"PIRL Training Time: {train_time:.2f}s")
+    print(f"PIRL Evaluation Time: {eval_time:.2f}s")
+    print(f"PIRL PDE Residuals: MAE={mae_pirl:.6e}, MSE={mse_pirl:.6e}")
+
+    # Save results
+    df = pd.DataFrame({
+        't': t_test.flatten(),
+        **{f"S{i+1}": S_test[:, i] for i in range(n)},
+        'PIRL_Prediction': V_predictions,
+        'PIRL_PDE_Residual': pirl_residuals
+    })
+    csv_name = f"pirl_results_{n}D.csv"
+    df.to_csv(csv_name, index=False)
+
+    log_name = f"pirl_results_{n}D.log"
+    with open(log_name, "w") as f:
+        f.write(f"PIRL Training Time: {train_time:.2f}s\n")
+        f.write(f"PIRL Evaluation Time: {eval_time:.2f}s\n")
+        f.write(f"PIRL PDE Residuals: MAE={mae_pirl:.6e}, MSE={mse_pirl:.6e}\n")
+        f.write(f"CSV File: {csv_name}\n")
+    
+    print(f"Saved detailed results to {csv_name}")
+    print(f"Saved log to {log_name}")
+
+    return pirl_model
+
+
+# ------- CLI -------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--n', type=int, default=4)
+    parser.add_argument('--sigma', type=float, nargs='+', default=None)
+    parser.add_argument('--rho', type=float, nargs='+', default=None)
+    parser.add_argument('--r', type=float, default=0.05)
+    parser.add_argument('--T', type=float, default=1.0)
+    parser.add_argument('--K', type=float, default=1.0)
+    parser.add_argument('--S0', type=float, nargs='+', default=None)
+    parser.add_argument('--pirl_epochs', type=int, default=None)
+    parser.add_argument('--batch_size', type=int, default=512)
+    parser.add_argument('--no_scheduler', action='store_true', help="Disable LR scheduler")
+    args = parser.parse_args()
+
+    rho_matrix = None
+    if args.rho is not None:
+        if len(args.rho) != args.n * args.n:
+            raise ValueError(f"rho must have {args.n*args.n} elements")
+        rho_matrix = np.reshape(args.rho, (args.n, args.n))
+
+    train_pirl_model(args.n, sigma=args.sigma, rho=rho_matrix,
+                     r=args.r, T=args.T, K=args.K, S0=args.S0,
+                     pirl_epochs=args.pirl_epochs, batch_size=args.batch_size,
+                     use_scheduler=(not args.no_scheduler))
+
+
+if __name__ == "__main__":
+    main()
