@@ -1,0 +1,295 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2761
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 import numpy as np\
+import matplotlib.pyplot as plt\
+from scipy.linalg import solve_banded\
+\
+# Parameters\
+K = 40  # Strike price\
+S0 = 36  # Current stock price\
+r = 0.06  # Risk-free rate\
+sigma = 0.2  # Volatility\
+T = 1  # Maturity time\
+\
+def explicit_fdm(S, K, r, sigma, T):\
+    """Explicit Finite Difference Method"""\
+    N = 200  # stock price steps\
+    Smax = 2 * K\
+    dS = Smax / N\
+    \
+    # Stability condition: dt <= dS^2 / (sigma^2 * Smax^2)\
+    dtMax = (dS * dS) / (sigma * sigma * Smax * Smax)\
+    M = int(np.ceil(T / dtMax) * 2)  # Extra safety factor\
+    dt = T / M\
+    \
+    # Initialize grid\
+    grid = np.zeros((M + 1, N + 1))\
+    \
+    # Boundary conditions\
+    grid[:, 0] = K  # S = 0\
+    grid[:, N] = 0  # S = Smax\
+    \
+    # Terminal condition\
+    for j in range(N + 1):\
+        s = j * dS\
+        grid[M, j] = max(K - s, 0)\
+    \
+    # Backward iteration\
+    for i in range(M - 1, -1, -1):\
+        for j in range(1, N):\
+            s = j * dS\
+            \
+            # Coefficients for explicit scheme\
+            pu = 0.5 * dt * ((sigma * sigma * j * j) + r * j)\
+            pm = 1 - dt * (sigma * sigma * j * j + r)\
+            pd = 0.5 * dt * ((sigma * sigma * j * j) - r * j)\
+            \
+            hold = pu * grid[i + 1, j + 1] + pm * grid[i + 1, j] + pd * grid[i + 1, j - 1]\
+            exercise = K - s\
+            grid[i, j] = max(hold, exercise)\
+    \
+    j = int(round(S / dS))\
+    return grid[0, j]\
+\
+def implicit_fdm(S, K, r, sigma, T):\
+    """Implicit Finite Difference Method"""\
+    M = 100\
+    N = 200\
+    dt = T / M\
+    Smax = 2 * K\
+    dS = Smax / N\
+    \
+    V = np.zeros(N + 1)\
+    \
+    # Terminal condition\
+    for j in range(N + 1):\
+        s = j * dS\
+        V[j] = max(K - s, 0)\
+    \
+    # Backward iteration\
+    for i in range(M - 1, -1, -1):\
+        A = np.zeros((N + 1, N + 1))\
+        b = np.zeros(N + 1)\
+        \
+        # Boundary conditions\
+        A[0, 0] = 1\
+        b[0] = K\
+        A[N, N] = 1\
+        b[N] = 0\
+        \
+        # Interior points\
+        for j in range(1, N):\
+            alpha = 0.5 * dt * (r * j - sigma * sigma * j * j)\
+            beta = 1 + dt * (sigma * sigma * j * j + r)\
+            gamma = -0.5 * dt * (r * j + sigma * sigma * j * j)\
+            \
+            A[j, j - 1] = alpha\
+            A[j, j] = beta\
+            A[j, j + 1] = gamma\
+            b[j] = V[j]\
+        \
+        # Solve system\
+        newV = np.linalg.solve(A, b)\
+        \
+        # Apply early exercise\
+        for j in range(N + 1):\
+            s = j * dS\
+            V[j] = max(newV[j], K - s)\
+    \
+    j = int(round(S / dS))\
+    return V[j]\
+\
+def crank_nicolson(S, K, r, sigma, T):\
+    """Crank-Nicolson Method"""\
+    M = 100\
+    N = 200\
+    dt = T / M\
+    Smax = 2 * K\
+    dS = Smax / N\
+    \
+    V = np.zeros(N + 1)\
+    \
+    # Terminal condition\
+    for j in range(N + 1):\
+        s = j * dS\
+        V[j] = max(K - s, 0)\
+    \
+    # Backward iteration\
+    for i in range(M - 1, -1, -1):\
+        A = np.zeros((N + 1, N + 1))\
+        b = np.zeros(N + 1)\
+        \
+        # Boundary conditions\
+        A[0, 0] = 1\
+        b[0] = K\
+        A[N, N] = 1\
+        b[N] = 0\
+        \
+        # Interior points\
+        for j in range(1, N):\
+            # Left hand side coefficients (implicit part)\
+            alpha_L = -0.25 * dt * (sigma * sigma * j * j - r * j)\
+            beta_L = 1 + 0.5 * dt * (sigma * sigma * j * j + r)\
+            gamma_L = -0.25 * dt * (sigma * sigma * j * j + r * j)\
+            \
+            A[j, j - 1] = alpha_L\
+            A[j, j] = beta_L\
+            A[j, j + 1] = gamma_L\
+            \
+            # Right hand side coefficients (explicit part)\
+            alpha_R = 0.25 * dt * (sigma * sigma * j * j - r * j)\
+            beta_R = 1 - 0.5 * dt * (sigma * sigma * j * j + r)\
+            gamma_R = 0.25 * dt * (sigma * sigma * j * j + r * j)\
+            \
+            b[j] = alpha_R * V[j - 1] + beta_R * V[j] + gamma_R * V[j + 1]\
+        \
+        newV = np.linalg.solve(A, b)\
+        \
+        # Apply early exercise condition\
+        for j in range(N + 1):\
+            s = j * dS\
+            V[j] = max(newV[j], K - s)\
+    \
+    j = int(round(S / dS))\
+    return V[j]\
+\
+def binomial_tree(S, K, r, sigma, T):\
+    """Binomial Tree Method"""\
+    N = 200\
+    dt = T / N\
+    u = np.exp(sigma * np.sqrt(dt))\
+    d = 1 / u\
+    p = (np.exp(r * dt) - d) / (u - d)\
+    \
+    # Initialize arrays\
+    stock_prices = np.zeros(N + 1)\
+    option_values = np.zeros(N + 1)\
+    \
+    # Terminal stock prices and option values\
+    for j in range(N + 1):\
+        stock_prices[j] = S * (u ** (N - j)) * (d ** j)\
+        option_values[j] = max(K - stock_prices[j], 0)\
+    \
+    # Backward induction\
+    for i in range(N - 1, -1, -1):\
+        for j in range(i + 1):\
+            stock_prices[j] = S * (u ** (i - j)) * (d ** j)\
+            hold = np.exp(-r * dt) * (p * option_values[j] + (1 - p) * option_values[j + 1])\
+            exercise = max(K - stock_prices[j], 0)\
+            option_values[j] = max(hold, exercise)\
+    \
+    return option_values[0]\
+\
+def monte_carlo(S, K, r, sigma, T):\
+    """Monte Carlo Method (Longstaff-Schwartz)"""\
+    M = 50  # time steps\
+    N = 10000  # paths\
+    dt = T / M\
+    \
+    # Generate paths\
+    np.random.seed(42)\
+    paths = np.zeros((N, M + 1))\
+    paths[:, 0] = S\
+    \
+    for j in range(1, M + 1):\
+        z = np.random.standard_normal(N)\
+        paths[:, j] = paths[:, j - 1] * np.exp((r - 0.5 * sigma * sigma) * dt + \
+                                                sigma * np.sqrt(dt) * z)\
+    \
+    # Initialize cash flows\
+    cash_flow = np.maximum(K - paths[:, M], 0)\
+    \
+    # Backward induction\
+    for j in range(M - 1, 0, -1):\
+        exercise = np.maximum(K - paths[:, j], 0)\
+        \
+        # Find in-the-money paths\
+        itm = exercise > 0\
+        \
+        if np.sum(itm) > 0:\
+            # Regression on in-the-money paths\
+            X = paths[itm, j]\
+            Y = cash_flow[itm] * np.exp(-r * dt)\
+            \
+            # Polynomial regression (degree 2)\
+            A = np.column_stack([np.ones_like(X), X, X**2])\
+            coeffs = np.linalg.lstsq(A, Y, rcond=None)[0]\
+            \
+            continuation = coeffs[0] + coeffs[1] * X + coeffs[2] * X**2\
+            \
+            # Update cash flows\
+            exercise_itm = exercise[itm]\
+            cash_flow[itm] = np.where(exercise_itm > continuation, \
+                                      exercise_itm, \
+                                      cash_flow[itm] * np.exp(-r * dt))\
+            \
+            # Discount non-exercised paths\
+            cash_flow[~itm] = cash_flow[~itm] * np.exp(-r * dt)\
+        else:\
+            cash_flow = cash_flow * np.exp(-r * dt)\
+    \
+    return np.mean(cash_flow * np.exp(-r * dt))\
+\
+# Generate data for different stock prices\
+print("Computing option prices...")\
+stock_prices = np.arange(20, 62, 2)\
+results = \{\
+    'Stock Price': stock_prices,\
+    'Explicit FDM': [],\
+    'Implicit FDM': [],\
+    'Crank-Nicolson': [],\
+    'Binomial Tree': [],\
+    'Monte Carlo': [],\
+    'Intrinsic Value': []\
+\}\
+\
+for S in stock_prices:\
+    print(f"Computing for S = $\{S\}...")\
+    results['Explicit FDM'].append(explicit_fdm(S, K, r, sigma, T))\
+    results['Implicit FDM'].append(implicit_fdm(S, K, r, sigma, T))\
+    results['Crank-Nicolson'].append(crank_nicolson(S, K, r, sigma, T))\
+    results['Binomial Tree'].append(binomial_tree(S, K, r, sigma, T))\
+    results['Monte Carlo'].append(monte_carlo(S, K, r, sigma, T))\
+    results['Intrinsic Value'].append(max(K - S, 0))\
+\
+# Print values at S0 = 36\
+print("\\n" + "="*60)\
+print(f"Option Values at Current Stock Price (S0 = $\{S0\}):")\
+print("="*60)\
+idx = np.where(stock_prices == S0)[0][0]\
+print(f"Explicit FDM:      $\{results['Explicit FDM'][idx]:.4f\}")\
+print(f"Implicit FDM:      $\{results['Implicit FDM'][idx]:.4f\}")\
+print(f"Crank-Nicolson:    $\{results['Crank-Nicolson'][idx]:.4f\}")\
+print(f"Binomial Tree:     $\{results['Binomial Tree'][idx]:.4f\}")\
+print(f"Monte Carlo:       $\{results['Monte Carlo'][idx]:.4f\}")\
+print(f"Intrinsic Value:   $\{results['Intrinsic Value'][idx]:.4f\}")\
+print("="*60)\
+\
+# Create the plot\
+plt.figure(figsize=(12, 8))\
+plt.plot(stock_prices, results['Explicit FDM'], 'b-', linewidth=2, label='Explicit FDM')\
+plt.plot(stock_prices, results['Implicit FDM'], 'purple', linewidth=2, label='Implicit FDM')\
+plt.plot(stock_prices, results['Crank-Nicolson'], 'g-', linewidth=2, label='Crank-Nicolson')\
+plt.plot(stock_prices, results['Binomial Tree'], 'orange', linewidth=2, label='Binomial Tree')\
+plt.plot(stock_prices, results['Monte Carlo'], 'r-', linewidth=2, label='Monte Carlo')\
+plt.plot(stock_prices, results['Intrinsic Value'], 'gray', linewidth=2, \
+         linestyle='--', label='Intrinsic Value')\
+\
+plt.xlabel('Stock Price ($)', fontsize=12)\
+plt.ylabel('Option Value ($)', fontsize=12)\
+plt.title('American Put Option Value vs Stock Price\\n' + \
+          f'K=\{K\}, S0=\{S0\}, r=\{r\}, \uc0\u963 =\{sigma\}, T=\{T\}', fontsize=14, fontweight='bold')\
+plt.legend(fontsize=10, loc='upper right')\
+plt.grid(True, alpha=0.3)\
+plt.tight_layout()\
+\
+# Save the figure\
+plt.savefig('american_put_option.png', dpi=300, bbox_inches='tight')\
+print("\\nFigure saved as 'american_put_option.png'")\
+plt.show()\
+}
